@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# build — Deterministic orchestrator for 1541 Ultimate firmware.
+# Delegates ALL build logic to ./build-tool. LOCAL-ONLY: never commit.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+BUILD_TOOL="$SCRIPT_DIR/build-tool"
+JTAG_DEPLOY="$SCRIPT_DIR/tooling/build_and_deploy_u64.sh"
+cd "$SCRIPT_DIR"
+
+# ── Deploy configuration ────────────────────────────────
+# The FTP deploy target is deliberately not hardcoded. Point DEPLOY_HOST at your
+# device (hostname or IP) to enable that step. Left unset, the FTP deploy is
+# skipped rather than reported as a failure, so the build and the JTAG deploy
+# still run normally.
+#   export DEPLOY_HOST=my-u64           # or an IP address
+# DEPLOY_PATH is the directory on the device's USB stick where custom firmware
+# is written. The default matches the stock Ultimate layout.
+DEPLOY_HOST="${DEPLOY_HOST:-}"
+DEPLOY_PATH="${DEPLOY_PATH:-/Usb1/firmware/u64/custom}"
+
+if [ -t 1 ] && [ "${NO_COLOR:-}" != "1" ]; then
+    R=$'\033[31m' G=$'\033[32m' Y=$'\033[33m' B=$'\033[34m' Z=$'\033[0m'
+else R="" G="" Y="" B="" Z=""; fi
+log()  { printf '%s[build]%s %s\n' "$B" "$Z" "$*"; }
+ok()   { printf '%s[build]%s %s\n' "$G" "$Z" "$*"; }
+warn() { printf '%s[build]%s WARNING: %s\n' "$Y" "$Z" "$*" >&2; }
+die()  { printf '%s[build]%s FATAL: %s\n' "$R" "$Z" "$*" >&2; exit 1; }
+
+CONVERGED=1; JTAG_OK=0; FTP_OK=0; FTP_SKIPPED=0; ARTIFACTS=(); FWD_ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c|--clean)        FWD_ARGS+=("$1"); shift ;;
+        --parallel)        FWD_ARGS+=("$1"); shift ;;
+        -j|--jobs)         FWD_ARGS+=("$1" "$2"); shift 2 ;;
+        --build-tools-dir) FWD_ARGS+=("$1" "$2"); shift 2 ;;
+        -i|--image)        FWD_ARGS+=("$1" "$2"); shift 2 ;;
+        -h|--help) echo "Usage: ./build [-c] [--parallel] [-j N] [--build-tools-dir DIR] [-i IMAGE]"; exit 0 ;;
+        *) die "Unknown option: $1" ;;
+    esac
+done
+[[ -x "$BUILD_TOOL" ]] || die "build-tool not found at $BUILD_TOOL"
+export BUILD_TOOL_ALLOW_PARTIAL=1
+
+step_build() {
+    local target=$1 ext=$2 min_mb=$3 max_mb=$4
+    log "Building $target"
+    "$BUILD_TOOL" "${FWD_ARGS[@]}" "$target"
+    local art
+    art=$(find "$SCRIPT_DIR" -maxdepth 1 -name "update_*.$ext" -newer "$TS_FILE" -print -quit 2>/dev/null || true)
+    [[ -n "$art" && -s "$art" ]] || die "$target: no fresh artifact (update_*.$ext)"
+    local size_mb
+    size_mb=$(awk "BEGIN{printf \"%.1f\", $(stat -c '%s' "$art") / 1048576}")
+    log "$target: $(basename "$art") — ${size_mb} MB"
+    awk "BEGIN{exit !($size_mb < $min_mb || $size_mb > $max_mb)}" \
+        && die "$target: size ${size_mb} MB outside expected ${min_mb}–${max_mb} MB"
+    ARTIFACTS+=("$art")
+}
+
+run_host_test() {
+    local name=$1 make_dir=$2 binary=$3
+    log "Running $name"
+    mkdir -p "$make_dir/output" "$make_dir/result"
+
+    local makefile=
+    for candidate in "$make_dir/Makefile" "$make_dir/makefile" "$make_dir/GNUmakefile"; do
+        if [[ -f "$candidate" ]]; then
+            makefile=$candidate
+            break
+        fi
+    done
+    if [[ -z "$makefile" ]]; then
+        warn "$name skipped: no makefile in $make_dir"
+        return 0
+    fi
+
+    make -C "$make_dir"
+    "$make_dir/$binary"
+    ok "$name passed"
+}
+
+ftp_deploy() {
+    # Skips cleanly when DEPLOY_HOST is unset (see the deploy configuration
+    # block near the top of this script).
+    if [[ -z "$DEPLOY_HOST" ]]; then
+        log "FTP deploy skipped: DEPLOY_HOST is not set"
+        FTP_SKIPPED=1
+        return 0
+    fi
+    log "FTP deploy to $DEPLOY_HOST:$DEPLOY_PATH"
+    FTP_OUT=$("$BUILD_TOOL" --deploy-only -d u64 --deploy-host "$DEPLOY_HOST" \
+        --deploy-path "$DEPLOY_PATH" 2>&1) && FTP_OK=1 || {
+        warn "FTP deploy failed"; echo "$FTP_OUT"
+        classify_error "$FTP_OUT" "FTP"; CONVERGED=0
+    }
+    [[ $FTP_OK -eq 1 ]] && ok "FTP deploy succeeded"
+    return 0
+}
+
+step_unit_tests() {
+    log "Running host unit tests before deploy"
+    run_host_test "machinemonitortest" "target/pc/linux/machinemonitortest" "result/machinemonitortest"
+    run_host_test "hexeditortest" "target/pc/linux/hexeditortest" "result/hexeditortest"
+}
+
+classify_error() {
+    local output=$1 label=$2
+    if echo "$output" | grep -qi "no route to host\|name or service not known\|could not resolve"; then
+        warn "$label: DNS / network failure"
+    elif echo "$output" | grep -qi "connection refused"; then
+        warn "$label: connection refused — device offline?"
+    elif echo "$output" | grep -qi "login\|auth\|530\|password"; then
+        warn "$label: authentication failure"
+    elif echo "$output" | grep -qi "no jtag\|jtagconfig\|hardware"; then
+        warn "$label: JTAG hardware unavailable"
+    elif echo "$output" | grep -qi "not found\|no such file\|missing"; then
+        warn "$label: required tool or file missing"
+    else
+        warn "$label: execution failure (see output above)"
+    fi
+}
+
+# ── PHASE 4: Clean state ────────────────────────────────
+log "Checking worktree state"
+DIRTY=$(git status --porcelain 2>/dev/null | grep -v '^??' || true)
+if [[ -n "$DIRTY" ]]; then
+    warn "Continuing with tracked modifications in the worktree"
+    printf '%s\n' "$DIRTY"
+fi
+
+log "Removing stale artifacts"
+rm -f update_*.u64 update_*.ue2 update_*.u2r update.u64 update.ue2 update.u2r
+log "Cleaning build output and FPGA work directories"
+find target/ -maxdepth 4 \( -name output -o -name result \) -type d -exec rm -rf {} + 2>/dev/null
+# Remove Xilinx ISE work subdirs and the stale per-run files it writes to the
+# makefile's invocation directory (_xmsgs, xlnx_auto_0_xdb, *.xrpt).
+# Without this, MAP crashes on the second build because it reads stale db data.
+for _xdir in target/fpga/rv700dd target/fpga/rv700au; do
+    rm -rf "$_xdir/work" "$_xdir/rv700dd" "$_xdir/rv700au" "$_xdir/_xmsgs" \
+           "$_xdir/xlnx_auto_0_xdb" 2>/dev/null || true
+    find "$_xdir" -maxdepth 1 \( -name '*.xrpt' -o -name '*.log' \
+         -o -name 'v*.str' -o -name 'v*.jou' \) -delete 2>/dev/null || true
+done
+rm -rf target/fpga/{mb700/work,mb700dd/work,mb700gm/work} 2>/dev/null || true
+STALE=$(find "$SCRIPT_DIR" -maxdepth 1 \( -name "update_*.u64" -o -name "update_*.ue2" -o -name "update_*.u2r" \) -print -quit 2>/dev/null || true)
+[[ -z "$STALE" ]] || die "Stale artifact remains after clean: $STALE"
+
+TS_FILE=$(mktemp); trap 'rm -f "$TS_FILE"' EXIT
+START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+log "Freshness baseline: $START_TIME"
+
+# Pre-create output dirs and gitinfo.h to prevent parallel make race in rules.mk
+log "Pre-seeding output dirs and gitinfo.h"
+GITINFO_TAG=$(git describe --tags 2>/dev/null || echo "unknown")
+GITINFO_BRANCH=$(git describe --all 2>/dev/null || echo "unknown")
+GITINFO_DATE=$(git log -n 1 --format=%ai 2>/dev/null || echo "unknown")
+GITINFO_HASH=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+GITINFO_BUILD="$(date +"%F %R")"
+GITINFO_HOST="$(hostname)"
+write_gitinfo() {
+    local d=$1
+    mkdir -p "$d/output" "$d/result"
+    cat >"$d/output/gitinfo.h" <<GITEOF
+/* Generated file, do not edit. */
+#define APP_VERSION_TAG    "${GITINFO_TAG}"
+#define APP_VERSION_BRANCH "${GITINFO_BRANCH}"
+#define APP_VERSION_DATE   "${GITINFO_DATE}"
+#define APP_VERSION_HASH   "${GITINFO_HASH}"
+#define APP_BUILD_DATE     "${GITINFO_BUILD}"
+#define APP_BUILD_MACHINE  "${GITINFO_HOST}"
+GITEOF
+}
+while IFS= read -r mf; do
+    write_gitinfo "$(dirname "$mf")"
+done < <(grep -rl 'include.*rules\.mk' target/ 2>/dev/null)
+
+# ── PHASE 5: Build all targets ──────────────────────────
+# Run the fast host-side UI tests before any build/deploy work so JTAG/FTP never
+# happen after a known unit-test regression.
+step_unit_tests
+
+# Parallel strategy: u64 and u64ii are both RISC-V/ESP32 targets with no
+# Xilinx ISE dependency, so they can run concurrently.  u2 needs Xilinx ISE
+# MAP which segfaults under memory pressure — it always runs alone, last.
+#
+# Serial layout:  u64 → JTAG → FTP → u64ii → u2
+# Parallel layout: u64+u64ii → (u64 done) → JTAG → FTP → u2
+
+PARALLEL=0
+for a in "${FWD_ARGS[@]}"; do [[ "$a" == "--parallel" ]] && PARALLEL=1; done
+
+if [[ $PARALLEL -eq 1 ]]; then
+    # ── Parallel phase: u64 and u64ii simultaneously ──────────────────────
+    log "Building u64 and u64ii in parallel"
+    _tmp=$(mktemp -d)
+    step_build u64   u64 4 6 >"$_tmp/u64.log"   2>&1 & _pid_u64=$!
+    step_build u64ii ue2 3 5 >"$_tmp/u64ii.log" 2>&1 & _pid_u64ii=$!
+
+    # Wait for u64 first — JTAG/FTP must follow it.
+    _u64_fail=0
+    wait $_pid_u64 || _u64_fail=1; cat "$_tmp/u64.log"
+    [[ $_u64_fail -eq 0 ]] || die "u64 build failed; aborting JTAG/FTP."
+
+    # ── JTAG deploy (u64ii may still be compiling; that's fine) ───────────
+    log "JTAG deploy (mandatory attempt)"
+    if [[ -x "$JTAG_DEPLOY" ]]; then
+        JTAG_OUT=$("$JTAG_DEPLOY" 2>&1) && JTAG_OK=1 || {
+            warn "JTAG deploy failed"; echo "$JTAG_OUT"
+            classify_error "$JTAG_OUT" "JTAG"; CONVERGED=0
+        }
+        [[ $JTAG_OK -eq 1 ]] && ok "JTAG deploy succeeded"
+    else
+        warn "JTAG deploy script not found at $JTAG_DEPLOY"; CONVERGED=0
+    fi
+
+    # ── FTP deploy ─────────────────────────────────────────────────────────
+    ftp_deploy
+
+    # ── Wait for u64ii to finish ───────────────────────────────────────────
+    _u64ii_fail=0
+    wait $_pid_u64ii || _u64ii_fail=1; cat "$_tmp/u64ii.log"
+    rm -rf "$_tmp"
+    [[ $_u64ii_fail -eq 0 ]] || die "u64ii build failed."
+
+    # ── u2 always runs alone (Xilinx ISE MAP is fragile under load) ────────
+    step_build u2 u2r 1 6
+
+else
+    # ── Serial layout ──────────────────────────────────────────────────────
+    step_build u64 u64 4 6
+
+    log "JTAG deploy (mandatory attempt)"
+    if [[ -x "$JTAG_DEPLOY" ]]; then
+        JTAG_OUT=$("$JTAG_DEPLOY" 2>&1) && JTAG_OK=1 || {
+            warn "JTAG deploy failed"; echo "$JTAG_OUT"
+            classify_error "$JTAG_OUT" "JTAG"; CONVERGED=0
+        }
+        [[ $JTAG_OK -eq 1 ]] && ok "JTAG deploy succeeded"
+    else
+        warn "JTAG deploy script not found at $JTAG_DEPLOY"; CONVERGED=0
+    fi
+
+    ftp_deploy
+
+    step_build u64ii ue2 3 5
+    step_build u2    u2r 1 6
+fi
+
+# ── PHASE 8: Output ─────────────────────────────────────
+echo ""
+ok "BUILD RESULTS"
+printf '%.0s─' {1..60}; echo
+for art in "${ARTIFACTS[@]}"; do
+    printf '  %-40s %s  %s\n' "$(basename "$art")" \
+        "$(awk "BEGIN{printf \"%.1f MB\", $(stat -c '%s' "$art") / 1048576}")" \
+        "$(stat -c '%y' "$art" | cut -d. -f1)"
+done
+printf '%.0s─' {1..60}; echo
+printf '  JTAG deploy:  %s\n' "$( [[ $JTAG_OK -eq 1 ]] && echo "${G}OK${Z}" || echo "${Y}FAILED${Z}" )"
+printf '  FTP  deploy:  %s\n' "$( [[ $FTP_OK -eq 1 ]] && echo "${G}OK${Z}" \
+    || { [[ $FTP_SKIPPED -eq 1 ]] && echo "${B}SKIPPED${Z}" || echo "${Y}FAILED${Z}"; } )"
+printf '%.0s─' {1..60}; echo
+if [[ $CONVERGED -eq 1 ]]; then ok "STATUS: SUCCESS"
+else warn "STATUS: NON-CONVERGED (deploy unavailable)"; fi

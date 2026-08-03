@@ -1,0 +1,571 @@
+#!/usr/bin/env bash
+# build-tool — build, deploy, and monitor 1541 Ultimate firmware via Docker
+#
+# Helpers are loaded from build-tool.d/ alongside this script.
+# If that directory is missing, run:  build-tool --install-helpers
+
+set -euo pipefail
+
+SCRIPT_NAME=$(basename "$0")
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
+HELPER_DIR="${SCRIPT_DIR}/build-tool.d"
+
+# ---------------------------------------------------------------------------
+# Defaults (read by helpers; must be set before sourcing them)
+# ---------------------------------------------------------------------------
+readonly DEFAULT_BASE_IMAGE="ghcr.io/gideonz/riscv:latest"
+readonly DEFAULT_PREPARED_IMAGE="1541u-build:latest"
+readonly PREPARED_IMAGE_REVISION="2"
+readonly DEFAULT_DEPLOY_USER="anonymous"
+readonly DEFAULT_DEPLOY_PASS=""
+readonly DEFAULT_DEPLOY_PATH="/Temp/"
+readonly DEFAULT_DEPLOY_PATH_U64="/USB2/Firmware/custom/"
+readonly DEFAULT_DEPLOY_PATH_U64II="/USB1/Firmware/custom/"
+readonly DEFAULT_FTP_POST_JTAG_WAIT_SECS=3
+readonly DEFAULT_JTAG_URL="ftdi://ftdi:232h/0"
+
+# ---------------------------------------------------------------------------
+# Mutable global state
+# ---------------------------------------------------------------------------
+CURRENT_ACTION=""
+DOCKER_IS_ROOTLESS=0
+REPO_DIR=""
+
+TARGETS=()
+DEPLOY_TARGETS=()
+JTAG_TARGETS=()
+JTAG_MONITOR_TARGETS=()
+UART_MONITOR_TARGETS=()
+BUILT_TARGETS=()
+BUILT_ARTIFACTS=()
+FAILED_TARGETS=()
+FAILED_DEPLOYS=()
+FAILED_FTP_UPLOADS=()
+FAILED_JTAGS=()
+FAILED_JTAG_MONITORS=()
+FAILED_UART_MONITORS=()
+
+BUILD_FAILED=0
+DEPLOY_FAILED=0
+FTP_UPLOAD_FAILED=0
+MONITOR_FAILED=0
+VERIFY_FAILED=0
+
+CLEAN_BUILD=0
+SW_ONLY=0
+PARALLEL_BUILD=0
+SKIP_SUBMODULE_UPDATE=0
+DRY_RUN=0
+DEPLOY_ONLY=0
+CUSTOM_IMAGE=0
+CHECK_SUPPORT=0
+U2_FLASH=0
+U2_FLASH_ARGS=()
+
+JOBS=""
+VERSION_STRING=""
+DOCKER_IMAGE="$DEFAULT_PREPARED_IMAGE"
+BASE_IMAGE="$DEFAULT_BASE_IMAGE"
+BUILD_TOOLS_DIR=""
+DEPLOY_HOST=""
+DEPLOY_USER="$DEFAULT_DEPLOY_USER"
+DEPLOY_PASS="$DEFAULT_DEPLOY_PASS"
+DEPLOY_PATH="$DEFAULT_DEPLOY_PATH"
+DEPLOY_PATH_EXPLICIT=0
+JTAG_URL="$DEFAULT_JTAG_URL"
+JTAG_MONITOR_SECS=5
+UART_PORT=""
+UART_BAUD=115200
+UART_MONITOR_SECS=5
+VERIFY_HOST=""
+FTP_POST_JTAG_WAIT_SECS=$DEFAULT_FTP_POST_JTAG_WAIT_SECS
+U64_JTAG_APP_ONLY=0
+
+# Colour placeholders — filled in by setup_colors() inside logging.sh
+COLOR_RED="" COLOR_GREEN="" COLOR_YELLOW=""
+COLOR_BLUE="" COLOR_CYAN="" COLOR_BOLD="" COLOR_RESET=""
+
+# ---------------------------------------------------------------------------
+# Bootstrap: source helpers (or install them if missing)
+# ---------------------------------------------------------------------------
+
+_install_helpers() {
+    printf 'build-tool: helper directory not found at %s\n' "$HELPER_DIR" >&2
+    printf 'Run:  %s --install-helpers\n' "$SCRIPT_NAME" >&2
+    exit 1
+}
+
+_source_helpers() {
+    local f
+    for f in \
+        logging.sh common.sh runtime.sh repo.sh targets.sh docker.sh \
+        image.sh probe.sh build.sh deploy.sh \
+        jtag.sh uart.sh verify.sh u2_flash.sh
+    do
+        # shellcheck source=/dev/null
+        source "${HELPER_DIR}/${f}"
+    done
+}
+
+# If asked to install helpers, write them from the embedded copies below.
+if [ "${1:-}" = "--install-helpers" ]; then
+    exec bash "$0" --_do_install_helpers
+fi
+
+if [ "${1:-}" = "--_do_install_helpers" ]; then
+    # shellcheck disable=SC2016
+    install_helpers_impl() {
+        printf 'Installing helpers to %s\n' "$HELPER_DIR"
+        mkdir -p "$HELPER_DIR"
+        # Write each helper from the canonical copy that lives next to this script.
+        # (No-op when build-tool.d/ already exists — just a safety net.)
+        local f
+        for f in logging.sh common.sh runtime.sh repo.sh targets.sh docker.sh \
+                  image.sh probe.sh build.sh deploy.sh \
+                  jtag.sh uart.sh verify.sh u2_flash.sh; do
+            local src="${SCRIPT_DIR}/build-tool.d/${f}"
+            if [ ! -f "$src" ]; then
+                printf '  SKIP %s (not found)\n' "$f"
+            else
+                printf '  OK   %s\n' "$f"
+            fi
+        done
+        printf 'Done.\n'
+    }
+    install_helpers_impl
+    exit 0
+fi
+
+if [ ! -d "$HELPER_DIR" ]; then
+    _install_helpers
+fi
+_source_helpers
+setup_colors
+trap on_error ERR
+
+# ---------------------------------------------------------------------------
+# Usage / help
+# ---------------------------------------------------------------------------
+
+usage() {
+    cat <<EOF
+${COLOR_BOLD}USAGE${COLOR_RESET}
+  ${SCRIPT_NAME} [OPTIONS] [TARGET...]
+
+${COLOR_BOLD}DESCRIPTION${COLOR_RESET}
+  Build, deploy, and monitor 1541 Ultimate firmware using Docker.
+  The default action (no targets) builds u64, u64ii, and u2.
+
+${COLOR_BOLD}TARGETS${COLOR_RESET}
+  u2        Ultimate II (RISC-V)              -> update.u2r
+  u2plus    Ultimate II+                      -> update.u2p
+  u2pl      Ultimate II+L                     -> update.u2l
+  u64       Ultimate 64                       -> update.u64
+  u64ii     Ultimate 64-II                    -> update.ue2
+  all       All of the above (default)
+
+${COLOR_BOLD}BUILD OPTIONS${COLOR_RESET}
+  -h, --help                 Show this help and exit
+  -c, --clean                Clean before building
+  -s, --sw-only              Software-only build (skip FPGA synthesis)
+  -j, --jobs N               Parallel make jobs (default: auto)
+  -v, --version STRING       Override version string (default: git short SHA)
+  -i, --image IMAGE          Docker image to use (default: ${DEFAULT_PREPARED_IMAGE})
+      --base-image IMAGE     Base image for preparing ${DEFAULT_PREPARED_IMAGE}
+                             (default: ${DEFAULT_BASE_IMAGE})
+      --build-tools-dir DIR  Mount host FPGA/Nios toolchains from DIR
+      --no-submodule-update  Skip git submodule init/update
+      --parallel             Build all selected targets concurrently
+      --dry-run              Print commands without executing them
+      --repo-dir DIR         Repo root override (default: auto-detect via git)
+      --check-support        Report which targets are buildable with current setup
+      --list-targets         List all targets with their toolchain requirements
+
+${COLOR_BOLD}DEPLOY OPTIONS${COLOR_RESET}
+  -d, --deploy TARGET        Upload built artifact to a device via FTP
+      --deploy-host HOST     Device hostname or IP (required)
+      --deploy-user USER     FTP username (default: ${DEFAULT_DEPLOY_USER})
+      --deploy-pass PASS     FTP password (default: empty)
+      --deploy-path PATH     Remote directory override
+                             (default: target-specific, else ${DEFAULT_DEPLOY_PATH})
+      --deploy-only          Skip build; deploy pre-existing artifacts only
+
+${COLOR_BOLD}JTAG OPTIONS${COLOR_RESET}
+      --jtag TARGET          Run JTAG deployment/recovery for a target
+      --jtag-monitor TARGET  Read JTAG terminal output for a target
+      --jtag-monitor-secs N  Capture JTAG output for N seconds (default: 5)
+      --jtag-url URL         FTDI JTAG cable URL (default: ${DEFAULT_JTAG_URL})
+
+${COLOR_BOLD}UART OPTIONS${COLOR_RESET}
+      --uart-monitor TARGET  Read UART serial output for a target
+      --uart-port DEVICE     Serial device (e.g. /dev/ttyUSB0)
+      --uart-baud N          Baud rate (default: 115200)
+      --uart-monitor-secs N  Capture duration in seconds (default: 5, 0 = until Ctrl-C)
+
+${COLOR_BOLD}VERIFICATION OPTIONS${COLOR_RESET}
+      --verify-host HOST     Override hostname for post-deploy REST checks
+                             (default: derived from target, e.g. u64 -> u64)
+
+${COLOR_BOLD}U2+L REST FLASH${COLOR_RESET}
+      --u2-flash [ARGS...]   Install U2+L firmware by uploading update.u2l and
+                             driving the on-device menu over REST (upload,
+                             verify, browse, and monitor a flash to completion;
+                             power-cycle requires an explicit --power-host and
+                             --confirm-power-cycle). Consumes the rest of the
+                             command line; run with --u2-flash --help for the
+                             full option list (implemented in tools/api/u2_flash.py).
+
+${COLOR_BOLD}NOTES${COLOR_RESET}
+  Full u2 builds require Xilinx ISE.
+  u2plus and u64 builds require Quartus/Nios tools even in --sw-only mode.
+  Full u2pl builds require Lattice Diamond.
+  The default image (${DEFAULT_PREPARED_IMAGE}) is prepared automatically from
+  ${DEFAULT_BASE_IMAGE}, adding esp32, esp32c3, and esp32s3 IDF targets.
+
+${COLOR_BOLD}EXAMPLES${COLOR_RESET}
+  ${SCRIPT_NAME}
+  ${SCRIPT_NAME} u64ii
+  ${SCRIPT_NAME} u64ii u64
+  ${SCRIPT_NAME} --parallel
+  ${SCRIPT_NAME} -s u2 u2pl
+  ${SCRIPT_NAME} u64ii -d u64ii --deploy-host <device-hostname>
+  ${SCRIPT_NAME} --deploy-only -d u64ii --deploy-host <device-ip>
+  ${SCRIPT_NAME} --jtag u64ii
+  ${SCRIPT_NAME} --jtag-monitor u64 --jtag-monitor-secs 3
+  ${SCRIPT_NAME} --uart-monitor u64 --uart-port /dev/ttyUSB0
+  ${SCRIPT_NAME} --check-support --build-tools-dir ~/intelFPGA_lite/18.1
+  ${SCRIPT_NAME} --list-targets
+  ${SCRIPT_NAME} --u2-flash --dry-run
+  ${SCRIPT_NAME} --u2-flash --upload-only
+  ${SCRIPT_NAME} --u2-flash --confirm-flash --power-host <power-switch-host> --confirm-power-cycle
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+_require_arg() {
+    [ "$#" -ge 2 ] || die_usage "Missing value for $1"
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage; exit 0
+            ;;
+        --list-targets)
+            list_targets_table; exit 0
+            ;;
+        --install-helpers)
+            # handled above; unreachable here
+            ;;
+        -c|--clean)
+            CLEAN_BUILD=1
+            ;;
+        -s|--sw-only)
+            SW_ONLY=1
+            ;;
+        --parallel)
+            PARALLEL_BUILD=1
+            ;;
+        -j|--jobs)
+            _require_arg "$@"; JOBS=$2; shift
+            ;;
+        -v|--version)
+            _require_arg "$@"; VERSION_STRING=$2; shift
+            ;;
+        -i|--image)
+            _require_arg "$@"; DOCKER_IMAGE=$2; CUSTOM_IMAGE=1; shift
+            ;;
+        --base-image)
+            _require_arg "$@"; BASE_IMAGE=$2; shift
+            ;;
+        --build-tools-dir)
+            _require_arg "$@"; BUILD_TOOLS_DIR=$2; shift
+            ;;
+        --no-submodule-update)
+            SKIP_SUBMODULE_UPDATE=1
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            ;;
+        --check-support)
+            CHECK_SUPPORT=1
+            ;;
+        --repo-dir)
+            _require_arg "$@"; REPO_DIR=$2; shift
+            ;;
+        -d|--deploy)
+            _require_arg "$@"
+            validate_target_name "$2" || die_usage "Unknown deploy target: $2"
+            DEPLOY_TARGETS+=("$2"); shift
+            ;;
+        --deploy-host)
+            _require_arg "$@"; DEPLOY_HOST=$2; shift
+            ;;
+        --deploy-user)
+            _require_arg "$@"; DEPLOY_USER=$2; shift
+            ;;
+        --deploy-pass)
+            _require_arg "$@"; DEPLOY_PASS=$2; shift
+            ;;
+        --deploy-path)
+            _require_arg "$@"; DEPLOY_PATH=$2; DEPLOY_PATH_EXPLICIT=1; shift
+            ;;
+        --deploy-only)
+            DEPLOY_ONLY=1
+            ;;
+        --jtag)
+            _require_arg "$@"
+            validate_target_name "$2" || die_usage "Unknown JTAG target: $2"
+            JTAG_TARGETS+=("$2"); shift
+            ;;
+        --jtag-monitor)
+            _require_arg "$@"
+            validate_target_name "$2" || die_usage "Unknown JTAG monitor target: $2"
+            JTAG_MONITOR_TARGETS+=("$2"); shift
+            ;;
+        --jtag-monitor-secs)
+            _require_arg "$@"; JTAG_MONITOR_SECS=$2; shift
+            ;;
+        --jtag-url)
+            _require_arg "$@"; JTAG_URL=$2; shift
+            ;;
+        --uart-monitor)
+            _require_arg "$@"
+            validate_target_name "$2" || die_usage "Unknown UART monitor target: $2"
+            UART_MONITOR_TARGETS+=("$2"); shift
+            ;;
+        --uart-port)
+            _require_arg "$@"; UART_PORT=$2; shift
+            ;;
+        --uart-baud)
+            _require_arg "$@"; UART_BAUD=$2; shift
+            ;;
+        --uart-monitor-secs)
+            _require_arg "$@"; UART_MONITOR_SECS=$2; shift
+            ;;
+        --verify-host)
+            _require_arg "$@"; VERIFY_HOST=$2; shift
+            ;;
+        --u2-flash)
+            U2_FLASH=1
+            shift
+            while [ "$#" -gt 0 ]; do
+                U2_FLASH_ARGS+=("$1"); shift
+            done
+            break
+            ;;
+        --)
+            shift
+            while [ "$#" -gt 0 ]; do
+                validate_target_name "$1" || die_usage "Unknown target: $1"
+                TARGETS+=("$1"); shift
+            done
+            break
+            ;;
+        -*)
+            die_usage "Unknown option: $1"
+            ;;
+        *)
+            validate_target_name "$1" || die_usage "Unknown target: $1"
+            TARGETS+=("$1")
+            ;;
+    esac
+    shift
+done
+
+# ---------------------------------------------------------------------------
+# Common setup
+# ---------------------------------------------------------------------------
+
+ensure_repo_root
+ensure_git_ready
+
+# ---------------------------------------------------------------------------
+# U2+L REST flash short-circuit (no build/Docker/toolchain setup needed)
+# ---------------------------------------------------------------------------
+
+if [ "$U2_FLASH" -eq 1 ]; then
+    run_u2_flash "${U2_FLASH_ARGS[@]}"
+    exit $?
+fi
+
+detect_default_build_tools_dir
+ensure_build_tools_dir
+
+# ---------------------------------------------------------------------------
+# Monitor-only short-circuit (no build/deploy requested)
+# ---------------------------------------------------------------------------
+
+MONITOR_ONLY=0
+if [ "${#TARGETS[@]}" -eq 0 ] \
+   && [ "${#DEPLOY_TARGETS[@]}" -eq 0 ] \
+   && [ "${#JTAG_TARGETS[@]}" -eq 0 ] \
+   && { [ "${#JTAG_MONITOR_TARGETS[@]}" -gt 0 ] \
+        || [ "${#UART_MONITOR_TARGETS[@]}" -gt 0 ]; } \
+   && [ "$DEPLOY_ONLY" -eq 0 ] \
+   && [ "$CHECK_SUPPORT" -eq 0 ]; then
+    MONITOR_ONLY=1
+fi
+
+if [ "$MONITOR_ONLY" -eq 1 ]; then
+    _mon_target="" _mon_resolved=()
+
+    if [ "${#JTAG_MONITOR_TARGETS[@]}" -gt 0 ]; then
+        while IFS= read -r _mon_target; do _mon_resolved+=("$_mon_target"); done \
+            < <(resolve_target_list "${JTAG_MONITOR_TARGETS[@]}")
+        for _mon_target in "${_mon_resolved[@]}"; do run_jtag_monitor "$_mon_target" || true; done
+    fi
+
+    _mon_resolved=()
+    if [ "${#UART_MONITOR_TARGETS[@]}" -gt 0 ]; then
+        while IFS= read -r _mon_target; do _mon_resolved+=("$_mon_target"); done \
+            < <(resolve_target_list "${UART_MONITOR_TARGETS[@]}")
+        for _mon_target in "${_mon_resolved[@]}"; do run_uart_monitor "$_mon_target" || true; done
+    fi
+
+    if [ "$MONITOR_FAILED" -ne 0 ]; then
+        [ "${#FAILED_JTAG_MONITORS[@]}"  -gt 0 ] && log_warn "JTAG monitor failures: ${FAILED_JTAG_MONITORS[*]}"
+        [ "${#FAILED_UART_MONITORS[@]}" -gt 0 ] && log_warn "UART monitor failures: ${FAILED_UART_MONITORS[*]}"
+        exit 4
+    fi
+    log_success "Completed successfully."
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Docker + version setup
+# ---------------------------------------------------------------------------
+
+ensure_docker_ready
+detect_jobs
+resolve_version
+normalize_deploy_path
+
+# A JTAG-only U64 invocation needs the application ELF, not an installation
+# package.  Treat the JTAG targets as the build selection when no positional
+# targets were supplied; otherwise the historical default expands to every
+# firmware target before downloading just one ELF.
+if [ "${#TARGETS[@]}" -eq 0 ] \
+   && [ "${#JTAG_TARGETS[@]}" -gt 0 ] \
+   && [ "${#DEPLOY_TARGETS[@]}" -eq 0 ] \
+   && [ "$DEPLOY_ONLY" -eq 0 ]; then
+    TARGETS=("${JTAG_TARGETS[@]}")
+fi
+expand_targets "${TARGETS[@]}"
+
+# JTAG downloads target/u64/nios2/ultimate/result/ultimate.elf directly.
+# Do not build the ESP32 bridge or package the updater unless an FTP deploy
+# also needs update.u64.
+if contains_value u64 "${TARGETS[@]}" \
+   && contains_value u64 "${JTAG_TARGETS[@]}" \
+   && ! contains_value u64 "${DEPLOY_TARGETS[@]}" \
+   && [ "$DEPLOY_ONLY" -eq 0 ]; then
+    U64_JTAG_APP_ONLY=1
+fi
+enforce_required_targets
+
+if [ "$DEPLOY_ONLY" -eq 1 ] \
+   && [ "${#DEPLOY_TARGETS[@]}" -eq 0 ] \
+   && [ "${#JTAG_TARGETS[@]}" -eq 0 ] \
+   && [ "${#JTAG_MONITOR_TARGETS[@]}" -eq 0 ] \
+   && [ "${#UART_MONITOR_TARGETS[@]}" -eq 0 ]; then
+    die_usage "--deploy-only requires at least one --deploy, --jtag, --jtag-monitor, or --uart-monitor target."
+fi
+
+verify_build_prereqs
+prepare_image
+
+# ---------------------------------------------------------------------------
+# --check-support
+# ---------------------------------------------------------------------------
+
+if [ "$CHECK_SUPPORT" -eq 1 ]; then
+    if check_support; then
+        log_success "All selected targets are buildable with the current configuration."
+        exit 0
+    fi
+    log_warn "One or more selected targets are not buildable with the current configuration."
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Build phase
+# ---------------------------------------------------------------------------
+
+if [ "$DEPLOY_ONLY" -eq 0 ]; then
+    update_submodules
+    run_clean
+    preseed_make_dirs
+
+    if [ "$PARALLEL_BUILD" -eq 1 ] && [ "${#TARGETS[@]}" -gt 1 ]; then
+        build_targets_parallel || true
+    else
+        _bt=""
+        for _bt in "${TARGETS[@]}"; do
+            build_target "$_bt" || true
+        done
+    fi
+
+    for _bt in "${BUILT_TARGETS[@]}"; do
+        verify_build_artifact "$_bt" || true
+    done
+fi
+
+print_summary
+
+# ---------------------------------------------------------------------------
+# Deploy phase
+# ---------------------------------------------------------------------------
+
+if [ "${#JTAG_TARGETS[@]}" -gt 0 ]; then
+    _jt_t="" _jt_r=()
+    while IFS= read -r _jt_t; do _jt_r+=("$_jt_t"); done \
+        < <(resolve_target_list "${JTAG_TARGETS[@]}")
+    for _jt_t in "${_jt_r[@]}"; do run_jtag_recovery "$_jt_t" || true; done
+    for _jt_t in "${_jt_r[@]}"; do
+        contains_value "$_jt_t" "${FAILED_JTAGS[@]+"${FAILED_JTAGS[@]}"}" \
+            || verify_deployment "$_jt_t" || true
+    done
+fi
+
+if [ "${#DEPLOY_TARGETS[@]}" -gt 0 ]; then
+    if [ "${#JTAG_TARGETS[@]}" -gt 0 ]; then
+        CURRENT_ACTION="Waiting ${FTP_POST_JTAG_WAIT_SECS}s after JTAG deployment"
+        run_command sleep "$FTP_POST_JTAG_WAIT_SECS"
+        CURRENT_ACTION=""
+    fi
+
+    _dp_t="" _dp_r=()
+    while IFS= read -r _dp_t; do _dp_r+=("$_dp_t"); done \
+        < <(resolve_target_list "${DEPLOY_TARGETS[@]}")
+    for _dp_t in "${_dp_r[@]}"; do deploy_target "$_dp_t" || true; done
+fi
+
+if [ "${#JTAG_MONITOR_TARGETS[@]}" -gt 0 ]; then
+    _jm_t="" _jm_r=()
+    while IFS= read -r _jm_t; do _jm_r+=("$_jm_t"); done \
+        < <(resolve_target_list "${JTAG_MONITOR_TARGETS[@]}")
+    for _jm_t in "${_jm_r[@]}"; do run_jtag_monitor "$_jm_t" || true; done
+fi
+
+# ---------------------------------------------------------------------------
+# Final exit status
+# ---------------------------------------------------------------------------
+
+[ "$BUILD_FAILED"   -ne 0 ] && log_warn "Build failures:       ${FAILED_TARGETS[*]}"
+[ "$DEPLOY_FAILED"  -ne 0 ] && {
+    [ "${#FAILED_DEPLOYS[@]}" -gt 0 ] && log_warn "Deploy failures:      ${FAILED_DEPLOYS[*]}"
+    [ "${#FAILED_JTAGS[@]}"   -gt 0 ] && log_warn "JTAG failures:        ${FAILED_JTAGS[*]}"
+}
+[ "$FTP_UPLOAD_FAILED" -ne 0 ] && log_warn "FTP upload warnings:  ${FAILED_FTP_UPLOADS[*]}"
+[ "$MONITOR_FAILED" -ne 0 ] && log_warn "JTAG monitor failures: ${FAILED_JTAG_MONITORS[*]}"
+
+[ "$DEPLOY_FAILED"  -ne 0 ] && exit 2
+[ "$MONITOR_FAILED" -ne 0 ] && exit 4
+[ "$BUILD_FAILED"   -ne 0 ] && exit 1
+[ "$VERIFY_FAILED"  -ne 0 ] && { log_warn "Post-deploy verification failed."; exit 3; }
+
+log_success "Completed successfully."
