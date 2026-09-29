@@ -13,11 +13,14 @@ it and provide:
 - `tooling/u64ii_jtag.sh` and `tooling/build_and_deploy_u64ii.sh` - JTAG for the C64
   Ultimate and Ultimate 64 Elite II through an FT232H: run an application or an FPGA
   image from RAM, read the console and memory. Nothing is flashed.
+- `vivado/install.sh` - an unattended install of AMD Vivado 2024.1 with Artix-7 support
+  only, including the AMD login, for building the Artix-7 FPGA images.
 - `patches/` - optional patches against the upstream repository.
 
 `docs/u64-jtag-deploy.md` explains what the U64 JTAG deploy does and, more importantly,
 what it deliberately does not do. `docs/c64u-jtag.md` covers the C64 Ultimate and
 Ultimate 64 Elite II, whose FPGA, CPU and JTAG path are different.
+`docs/vivado-install.md` covers the Vivado install.
 
 ## Installing into a checkout
 
