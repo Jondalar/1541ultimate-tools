@@ -10,10 +10,14 @@ it and provide:
   deploy, then the remaining targets.
 - `tooling/build_and_deploy_u64.sh` - a fast JTAG redeploy of an already-built U64
   application, used both by hand and by the end-to-end test suites.
+- `tooling/u64ii_jtag.sh` and `tooling/build_and_deploy_u64ii.sh` - JTAG for the C64
+  Ultimate and Ultimate 64 Elite II through an FT232H: run an application or an FPGA
+  image from RAM, read the console and memory. Nothing is flashed.
 - `patches/` - optional patches against the upstream repository.
 
-`docs/u64-jtag-deploy.md` explains what the JTAG deploy does and, more importantly,
-what it deliberately does not do.
+`docs/u64-jtag-deploy.md` explains what the U64 JTAG deploy does and, more importantly,
+what it deliberately does not do. `docs/c64u-jtag.md` covers the C64 Ultimate and
+Ultimate 64 Elite II, whose FPGA, CPU and JTAG path are different.
 
 ## Installing into a checkout
 
@@ -27,10 +31,10 @@ cd 1541ultimate
 cp -r ../1541ultimate-tools/build \
       ../1541ultimate-tools/build.cmd \
       ../1541ultimate-tools/build-tool \
-      ../1541ultimate-tools/build-tool.d .
-mkdir -p tooling
-cp ../1541ultimate-tools/tooling/build_and_deploy_u64.sh tooling/
-chmod +x build build-tool tooling/build_and_deploy_u64.sh
+      ../1541ultimate-tools/build-tool.d \
+      ../1541ultimate-tools/tooling \
+      ../1541ultimate-tools/.build-tool.env.example .
+chmod +x build build-tool tooling/*.sh tooling/*.py
 ```
 
 The resulting layout:
@@ -41,8 +45,19 @@ The resulting layout:
 ├── build.cmd             Windows shim for build
 ├── build-tool            the builder
 ├── build-tool.d/         helper libraries build-tool sources at startup
+├── .build-tool.env       optional per-checkout settings (copy the .example)
 └── tooling/
-    └── build_and_deploy_u64.sh
+    ├── build_and_deploy_u64.sh      U64: run the built ELF via nios2-download
+    ├── read_u64_jtag_terminal.sh    U64: nios2-terminal capture
+    ├── read_u64_uart_terminal.sh    U64: debug UART through a USB-TTL adapter
+    ├── build_and_deploy_u64ii.sh    C64U / U64E-II: run the built ultimate.bin
+    ├── read_u64ii_jtag_terminal.sh  C64U / U64E-II: console over JTAG
+    ├── u64ii_jtag.sh                C64U / U64E-II: JTAG tool (pyftdi venv)
+    ├── u64ii_jtag.py
+    ├── test_u64ii_jtag.py           host tests against a simulated FT232H
+    ├── test_apply_pr.sh             host tests for apply_pr.sh
+    ├── c64u_monitor.py              video stream, REST and console watcher
+    └── apply_pr.sh                  worktree with upstream PRs applied, uncommitted
 ```
 
 `build-tool` will not start without `build-tool.d/` beside it.
@@ -61,6 +76,8 @@ build
 build-tool
 build.cmd
 tooling/
+.build-tool.env
+.build-tool.env.example
 IGNORE
 ```
 
@@ -80,7 +97,8 @@ dependency files, which already covers it.
 |---|---|
 | Docker | Every RISC-V target (u2, u2pl, u64ii) |
 | Quartus and Nios II EDS, on the host | The Nios II targets (u64, u2plus). The RISC-V image has no Nios toolchain, so these cannot build inside Docker. |
-| USB-Blaster | JTAG deploy and JTAG monitoring only |
+| USB-Blaster | U64 JTAG deploy and JTAG monitoring only |
+| FT232H (e.g. Adafruit) and Python 3 | C64 Ultimate / Ultimate 64 Elite II JTAG only; pyftdi is installed into a virtual environment on first use |
 | Lattice Diamond | Full `u2pl` FPGA synthesis only. See the u2pl note below. |
 
 `build-tool` derives a prepared image `1541u-build:latest` from
@@ -102,11 +120,12 @@ u2       update.u2r      RISC-V + Xilinx ISE (sw-only: cached FPGA)
 u2plus   update.u2p      Nios2 + Quartus (sw-only: cached FPGA)
 u2pl     update.u2l      RISC-V + Lattice Diamond + ESP32-C3
 u64      update.u64      Nios2 + Quartus + ESP32
-u64ii    update.ue2      RISC-V + ESP32-S3
+u64ii    update.ue2      RISC-V + ESP32-S3 (alias c64u; FPGA from external/)
 all      (all above)     builds u64 u64ii u2 (default)
 ```
 
-Short aliases are accepted: `ue2` for `u64ii`, `u2l` for `u2pl`.
+Short aliases are accepted: `ue2` and `c64u` for `u64ii`, `u2l` for `u2pl`. The C64
+Ultimate is Ultimate 64 Elite II hardware and uses the same target.
 
 ## Usage
 
@@ -146,6 +165,30 @@ the Intel FPGA tools are somewhere the script does not find on its own:
 INTEL_FPGA_ROOT=/opt/intelFPGA_lite/19.1 bash tooling/build_and_deploy_u64.sh
 ```
 
+Run a C64 Ultimate or Ultimate 64 Elite II application from RAM over JTAG (FT232H;
+see `docs/c64u-jtag.md` for wiring and the first `probe`):
+
+```bash
+./build-tool --jtag c64u                     # build ultimate.bin, run it from RAM
+./build-tool --jtag c64u --jtag-fpga warm    # keep the FPGA image, restart only the CPU
+./build-tool --jtag-monitor c64u             # the application's console output
+tooling/u64ii_jtag.sh probe                  # identify the board; changes nothing
+```
+
+Run a pull request without touching your checkout; build-tool applies it in a
+throwaway worktree and builds that (see `docs/c64u-jtag.md`, "Running a pull request"):
+
+```bash
+./build-tool --apply-pr 705 --pr-base upstream/master --jtag c64u
+```
+
+Build another firmware tree with the same layout, for example a C64 Ultimate firmware
+tree, with `--repo-dir`; build-tool builds its ESP32-S3 firmware first when needed:
+
+```bash
+./build-tool --repo-dir ../other-tree c64u
+```
+
 Run the full sweep, which cleans first, runs the host unit tests, and checks each
 artifact's size against an expected range:
 
@@ -160,8 +203,9 @@ use it for a full check rather than for iteration.
 ## Device-specific configuration
 
 Deploy and verification steps need to know which device to talk to. Nothing is
-hardcoded; each setting is read from the environment, and each one is skipped rather
-than failed when unset.
+hardcoded; each setting is read from the environment, or from `.build-tool.env` beside
+the scripts (see `.build-tool.env.example`), and each one is skipped rather than
+failed when unset.
 
 | Variable | Used by | Effect when unset |
 |---|---|---|
@@ -169,6 +213,8 @@ than failed when unset.
 | `DEPLOY_PATH` | `build`, FTP deploy step | Defaults to `/Usb1/firmware/u64/custom` |
 | `U64_VERIFY_HOST` | post-deploy REST check for u64 | Verification is skipped with a warning |
 | `U64II_VERIFY_HOST` | post-deploy REST check for u64ii | Verification is skipped with a warning |
+| `U64II_JTAG_URL` | FT232H for u64ii JTAG | `ftdi://ftdi:232h/1` |
+| `INTEL_FPGA_ROOT` | U64 JTAG deploy and monitor | Searched under `~/intelFPGA_lite`, `~/altera_lite`, `/opt/...` |
 
 ```bash
 export DEPLOY_HOST=my-u64          # hostname or IP
@@ -228,6 +274,13 @@ This reproduces on an unmodified upstream branch, so it is pre-existing rather t
 caused by a local change. Upstream CI stays green because its self-hosted runner uses
 a different image whose g++ is less strict. Before treating a failure here as a
 regression, build the same target from a clean checkout and compare.
+
+To build them with the toolchain upstream CI uses, place a `riscv32-unknown-elf` GCC
+10.2.0 at `riscv/` inside the build tools directory (`--build-tools-dir`), so that
+`<build tools>/riscv/bin/riscv32-unknown-elf-g++` exists. `build-tool` then puts it
+ahead of the image's toolchain for u2, u2pl and u64ii, and stops if its version or
+checksum is not the pinned CI build. Without that directory the image's toolchain is
+used, and no build tools directory is needed for these targets.
 
 `BUILD_TOOL_ALLOW_PARTIAL=1` lets a multi-target run continue past one failing target
 instead of stopping at the first.

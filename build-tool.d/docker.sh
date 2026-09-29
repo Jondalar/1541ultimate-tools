@@ -60,8 +60,32 @@ detect_xilinx_license_file() {
 configure_build_tools() {
     local root="${BUILD_TOOLS_ROOT:-}"
     local candidate quartus_base="" lattice_base="" xilinx_root="" xilinx_platform=""
+    local riscv_base="" riscv_version="" riscv_target="" riscv_banner="" riscv_sha=""
 
     [ -n "$root" ] || return 0
+
+    riscv_base="$root/riscv"
+    # A RISC-V toolchain under <build tools>/riscv takes precedence over the
+    # image's own, and is then required to be the build upstream CI uses. With
+    # none mounted, the image's toolchain builds the RISC-V targets.
+    if [ "${REQUIRE_RISCV:-0}" = "1" ] && [ -x "$riscv_base/bin/riscv32-unknown-elf-g++" ]; then
+        riscv_version=$("$riscv_base/bin/riscv32-unknown-elf-g++" \
+            -dumpfullversion -dumpversion)
+        [ "$riscv_version" = "10.2.0" ] \
+            || container_fail "RISC-V GCC ${riscv_version} does not match CI GCC 10.2.0."
+        riscv_target=$("$riscv_base/bin/riscv32-unknown-elf-g++" -dumpmachine)
+        [ "$riscv_target" = "riscv32-unknown-elf" ] \
+            || container_fail "RISC-V target ${riscv_target} does not match the pinned toolchain."
+        riscv_banner=$("$riscv_base/bin/riscv32-unknown-elf-g++" --version | head -n 1)
+        case "$riscv_banner" in
+            "riscv32-unknown-elf-g++ (GCC) 10.2.0") ;;
+            *) container_fail "RISC-V GCC is not the pinned CI-compatible build." ;;
+        esac
+        riscv_sha=$(sha256sum "$riscv_base/bin/riscv32-unknown-elf-g++" | cut -d' ' -f1)
+        [ "$riscv_sha" = "85cb6aba16e943239047a41ca19af24001c12ea33f4c9fae1c7bf4c4e31add80" ] \
+            || container_fail "RISC-V GCC binary does not match the pinned CI toolchain."
+        append_path_if_dir "$riscv_base/bin"
+    fi
 
     for candidate in \
         "$root" \
@@ -175,7 +199,16 @@ EOF
 # _docker_base_cmd — build the common docker run prefix into an array
 _docker_base_cmd() {
     local cmd=(docker run --rm --entrypoint /bin/bash -v "${REPO_DIR}":/__w)
-    local host_uid host_gid
+    local host_uid host_gid common_dir
+
+    # In a git worktree, .git points at the main checkout's git directory,
+    # which the container cannot see; git-derived version strings then come
+    # out empty. Mount that directory at the same path, read-only.
+    common_dir=$(git -C "$REPO_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    case "$common_dir" in
+        ""|"$REPO_DIR"/*) ;;
+        *) cmd+=(-v "$common_dir":"$common_dir":ro) ;;
+    esac
 
     if [ "$DOCKER_IS_ROOTLESS" -eq 0 ]; then
         host_uid=$(id -u)
@@ -190,10 +223,10 @@ _docker_base_cmd() {
     printf '%s\0' "${cmd[@]}"
 }
 
-# docker_run_build_script SCRIPT_BODY REQUIRE_NIOS REQUIRE_XILINX REQUIRE_LATTICE [NEEDS_IDF]
+# docker_run_build_script SCRIPT_BODY REQUIRE_NIOS REQUIRE_XILINX REQUIRE_LATTICE [NEEDS_IDF] [REQUIRE_RISCV]
 docker_run_build_script() {
     local script_body=$1 require_nios=$2 require_xilinx=$3 require_lattice=$4
-    local needs_idf=${5:-1} idf_setup=""
+    local needs_idf=${5:-1} require_riscv=${6:-0} idf_setup=""
     local cmd=()
 
     if [ "$needs_idf" -eq 1 ]; then
@@ -206,7 +239,8 @@ docker_run_build_script() {
 
     cmd+=(-e REQUIRE_NIOS="$require_nios"
           -e REQUIRE_XILINX="$require_xilinx"
-          -e REQUIRE_LATTICE="$require_lattice")
+          -e REQUIRE_LATTICE="$require_lattice"
+          -e REQUIRE_RISCV="$require_riscv")
     cmd+=("$DOCKER_IMAGE" -lc "set -euo pipefail
 mkdir -p \"\$HOME\"
 ${idf_setup}
@@ -223,7 +257,7 @@ capture_docker_script_output() {
         cmd+=("$token")
     done < <(_docker_base_cmd)
 
-    cmd+=(-e REQUIRE_NIOS=0 -e REQUIRE_XILINX=0 -e REQUIRE_LATTICE=0)
+    cmd+=(-e REQUIRE_NIOS=0 -e REQUIRE_XILINX=0 -e REQUIRE_LATTICE=0 -e REQUIRE_RISCV=1)
     cmd+=("$DOCKER_IMAGE" -lc "set -euo pipefail
 mkdir -p \"\$HOME\"
 if [ -n \"\${IDF_PATH:-}\" ] && [ -f \"\$IDF_PATH/export.sh\" ]; then

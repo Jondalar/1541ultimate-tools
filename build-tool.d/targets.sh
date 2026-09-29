@@ -6,15 +6,18 @@ CANONICAL_TARGETS=(u64 u64ii u2)
 
 validate_target_name() {
     case "$1" in
-        u2|u2rv|u2_rv|u2plus|u2pl|u64|u64ii|ue2|all) return 0 ;;
+        u2|u2rv|u2_rv|u2plus|u2pl|u2l|u64|u64ii|ue2|c64u|all) return 0 ;;
         *) return 1 ;;
     esac
 }
 
 normalize_target_name() {
     case "$1" in
-        u2|u2rv|u2_rv) printf 'u2' ;;
-        u64ii|ue2)     printf 'u64ii' ;;
+        u2|u2rv|u2_rv)   printf 'u2' ;;
+        u2pl|u2l)        printf 'u2pl' ;;
+        # The C64 Ultimate is Ultimate 64 Elite II hardware: same Artix-7
+        # FPGA, RISC-V CPU and update.ue2 package.
+        u64ii|ue2|c64u)  printf 'u64ii' ;;
         *)             printf '%s' "$1" ;;
     esac
 }
@@ -67,6 +70,30 @@ resolve_target_list() {
         contains_value "$normalized" "${resolved[@]}" || resolved+=("$normalized")
     done
     printf '%s\n' "${resolved[@]}"
+}
+
+# jtag_app_only TARGET — true when TARGET is built only for a JTAG run: the
+# application image, without the ESP32 firmware or the update package.
+jtag_app_only() {
+    contains_value "$1" "${JTAG_APP_ONLY_TARGETS[@]+"${JTAG_APP_ONLY_TARGETS[@]}"}"
+}
+
+# target_app_makefile TARGET — the makefile of the application a JTAG run loads
+target_app_makefile() {
+    case "$1" in
+        u64)   printf 'target/u64/nios2/ultimate/Makefile' ;;
+        u64ii) printf 'target/u64ii/riscv/ultimate/Makefile' ;;
+        *) return 1 ;;
+    esac
+}
+
+# target_jtag_image TARGET — the file a JTAG run loads into the device
+target_jtag_image() {
+    case "$1" in
+        u64)   printf 'target/u64/nios2/ultimate/result/ultimate.elf' ;;
+        u64ii) printf 'target/u64ii/riscv/ultimate/result/ultimate.bin' ;;
+        *) return 1 ;;
+    esac
 }
 
 # target_output_name TARGET — canonical firmware filename
@@ -123,8 +150,13 @@ target_requires_lattice() {
     case "$1" in u2pl) return 0 ;; *) return 1 ;; esac
 }
 
+target_requires_riscv() {
+    case "$1" in u2|u2pl|u64ii) return 0 ;; *) return 1 ;; esac
+}
+
 target_needs_build_tools() {
-    target_requires_nios "$1" || target_requires_xilinx "$1" || target_requires_lattice "$1"
+    target_requires_nios "$1" || target_requires_xilinx "$1" \
+        || target_requires_lattice "$1"
 }
 
 # target_artifact_path TARGET — versioned output filename
@@ -164,6 +196,6 @@ list_targets_table() {
     printf '%-8s %-15s %s\n' u2plus update.u2p  "Nios2 + Quartus (sw-only: cached FPGA)"
     printf '%-8s %-15s %s\n' u2pl   update.u2l  "RISC-V + Lattice Diamond + ESP32-C3"
     printf '%-8s %-15s %s\n' u64    update.u64  "Nios2 + Quartus + ESP32"
-    printf '%-8s %-15s %s\n' u64ii  update.ue2  "RISC-V + ESP32-S3"
+    printf '%-8s %-15s %s\n' u64ii  update.ue2  "RISC-V + ESP32-S3 (alias c64u; FPGA from external/)"
     printf '%-8s %-15s %s\n' all    "(all above)" "builds u64 u64ii u2 (default)"
 }

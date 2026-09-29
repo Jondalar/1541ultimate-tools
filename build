@@ -7,6 +7,11 @@ BUILD_TOOL="$SCRIPT_DIR/build-tool"
 JTAG_DEPLOY="$SCRIPT_DIR/tooling/build_and_deploy_u64.sh"
 cd "$SCRIPT_DIR"
 
+# Per-checkout settings, shared with build-tool (see .build-tool.env.example).
+if [[ -f "$SCRIPT_DIR/.build-tool.env" ]]; then
+    set -a; source "$SCRIPT_DIR/.build-tool.env"; set +a
+fi
+
 # ── Deploy configuration ────────────────────────────────
 # The FTP deploy target is deliberately not hardcoded. Point DEPLOY_HOST at your
 # device (hostname or IP) to enable that step. Left unset, the FTP deploy is

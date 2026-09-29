@@ -5,11 +5,13 @@ verify_build_artifact() {
     local target=$1
     local elf="" min_size=0 artifact artifact_size magic
 
-    if [ "$target" = "u64" ] && [ "$U64_JTAG_APP_ONLY" -eq 1 ]; then
-        elf="$REPO_DIR/target/u64/nios2/ultimate/result/ultimate.elf"
-        CURRENT_ACTION="Verifying U64 JTAG application"
-        if [ ! -s "$elf" ]; then
-            log_error "U64 JTAG application ELF is missing."
+    if jtag_app_only "$target"; then
+        local image
+        image="$REPO_DIR/$(target_jtag_image "$target")"
+        elf="${image%.*}.elf"
+        CURRENT_ACTION="Verifying ${target} JTAG application"
+        if [ ! -s "$image" ] || [ ! -s "$elf" ]; then
+            log_error "${target} JTAG application is missing: ${image}"
             CURRENT_ACTION=""; return 1
         fi
         magic=$(xxd -p -l 4 "$elf" 2>/dev/null || true)
@@ -17,8 +19,8 @@ verify_build_artifact() {
             log_error "ELF ${elf} has invalid magic: ${magic} (expected 7f454c46)."
             CURRENT_ACTION=""; return 1
         fi
-        log_info "U64 JTAG application ELF magic OK: ${elf}"
-        log_success "U64 JTAG application verified."
+        log_info "${target} JTAG application OK: ${image}"
+        log_success "${target} JTAG application verified."
         CURRENT_ACTION=""; return 0
     fi
 
@@ -68,10 +70,10 @@ verify_build_artifact() {
 
 target_verify_host() {
     # Device hostnames for the post-deploy REST health check are deliberately
-    # not hardcoded. Set these environment variables, or pass --verify-host, to
-    # enable the check against your own boards:
-    #   export U64_VERIFY_HOST=my-u64
-    #   export U64II_VERIFY_HOST=my-u64ii
+    # not hardcoded. Set these environment variables (for example in
+    # .build-tool.env), or pass --verify-host, to enable the check:
+    #   U64_VERIFY_HOST=my-u64
+    #   U64II_VERIFY_HOST=my-c64u
     # With neither set, verify_deployment logs "No verify host known" and skips
     # the check instead of failing the run.
     case "$1" in
@@ -88,6 +90,10 @@ verify_deployment() {
     [ -z "$host" ] && host=$(target_verify_host "$target" 2>/dev/null || true)
     if [ -z "$host" ]; then
         log_warn "No verify host known for ${target}, skipping post-deploy verification."
+        return 0
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log_info "Dry run: skipping post-deploy verification against ${host}."
         return 0
     fi
 

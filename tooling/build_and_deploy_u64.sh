@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+ROOT="${ULTIMATE_REPO_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)}"
 ELF_PATH="$ROOT/target/u64/nios2/ultimate/result/ultimate.elf"
 
 log() { printf '[u64-jtag] %s\n' "$*"; }

@@ -51,7 +51,7 @@ update_submodules() {
 run_clean() {
     [ "$CLEAN_BUILD" -eq 0 ] || [ "$DEPLOY_ONLY" -eq 1 ] && return 0
 
-    local clean_target require_nios=0 require_xilinx=0 require_lattice=0
+    local clean_target require_nios=0 require_xilinx=0 require_lattice=0 require_riscv=0
     clean_target=$([ "$SW_ONLY" -eq 1 ] && echo sw_clean || echo clean)
 
     local target
@@ -59,6 +59,7 @@ run_clean() {
         target_requires_nios    "$target" && require_nios=1
         target_requires_xilinx  "$target" && require_xilinx=1
         target_requires_lattice "$target" && require_lattice=1
+        target_requires_riscv   "$target" && require_riscv=1
     done
 
     CURRENT_ACTION="Cleaning build outputs"
@@ -66,7 +67,7 @@ run_clean() {
         "${CONTAINER_PRELUDE}
 cd /__w
 make ${clean_target}" \
-        "$require_nios" "$require_xilinx" "$require_lattice"
+        "$require_nios" "$require_xilinx" "$require_lattice" 1 "$require_riscv"
     CURRENT_ACTION=""
 }
 
@@ -82,7 +83,11 @@ preseed_make_dirs() {
     # HEAD changed.  A wall-clock value makes gitinfo.h newer every run and
     # needlessly recompiles system_info.cc.  Commit time still identifies the
     # firmware revision while keeping the generated header stable.
-    if [ "$U64_JTAG_APP_ONLY" -eq 1 ]; then
+    local app_only=1 target
+    for target in "${TARGETS[@]}"; do
+        jtag_app_only "$target" || app_only=0
+    done
+    if [ "$app_only" -eq 1 ]; then
         git_build=$(git log -n 1 --format=%ai 2>/dev/null || echo unknown)
     else
         git_build=$(date +"%F %R")
@@ -90,8 +95,10 @@ preseed_make_dirs() {
     git_host=$(hostname)
 
     local -a makefiles=()
-    if [ "$U64_JTAG_APP_ONLY" -eq 1 ]; then
-        makefiles=(target/u64/nios2/ultimate/Makefile)
+    if [ "$app_only" -eq 1 ]; then
+        for target in "${TARGETS[@]}"; do
+            makefiles+=("$(target_app_makefile "$target")")
+        done
     else
         while IFS= read -r -d '' makefile; do
             makefiles+=("$makefile")
@@ -120,16 +127,33 @@ _build_target_script() {
     local target=$1
     local make_target
     make_target=$(target_make_name "$target")
+    # A fresh worktree has no output/ or result/ directories, and the library
+    # makefiles do not create them.
+    local mkdirs="find target -type f \\( -iname 'makefile' -o -iname 'Makefile' \\) -printf '%h\\n' \\
+    | sort -u | xargs -I {} mkdir -p '{}/output' '{}/result' 2>/dev/null || true"
 
-    if [ "$target" = "u64" ] && [ "$U64_JTAG_APP_ONLY" -eq 1 ]; then
+    if [ "$target" = "u64" ] && jtag_app_only u64; then
         cat <<SCRIPT
 ${CONTAINER_PRELUDE}
 cd /__w
+${mkdirs}
 make -j ${JOBS} -C tools
 make -j ${JOBS} -C software/nios_solo_bsp
 make -j ${JOBS} -C software/nios_appl_bsp
 make -j ${JOBS} -C target/libs/nios2/lwip
 make -j ${JOBS} -C target/u64/nios2/ultimate result/ultimate.elf
+SCRIPT
+        return
+    fi
+
+    if [ "$target" = "u64ii" ] && jtag_app_only u64ii; then
+        cat <<SCRIPT
+${CONTAINER_PRELUDE}
+cd /__w
+${mkdirs}
+make -j ${JOBS} -C tools
+make -j ${JOBS} -C target/libs/riscv/lwip
+make -j ${JOBS} -C target/u64ii/riscv/ultimate
 SCRIPT
         return
     fi
@@ -164,10 +188,19 @@ rm -f /__w/software/u64ctrl/build/project_elf_src_esp32s3.c 2>/dev/null || true"
                 ;;
         esac
 
+        # The updater embeds the ESP32-S3 firmware. Trees whose u64ii goal does
+        # not depend on esp32_u64ctrl (a C64 Ultimate firmware tree) need it
+        # built first, and not in parallel with u64ii.
+        local esp_prereq=""
+        if [ "$target" = "u64ii" ]; then
+            esp_prereq="grep -Eq '^u64ii::?.*esp32_u64ctrl' Makefile || make esp32_u64ctrl"
+        fi
+
         cat <<SCRIPT
 ${CONTAINER_PRELUDE}
 cd /__w
 ${esp_log_clean}
+${esp_prereq}
 find target -type f \( -iname 'makefile' -o -iname 'Makefile' \) -printf '%h\n' \
     | sort -u | xargs -I {} mkdir -p '{}/output' '{}/result' 2>/dev/null || true
 make -j ${JOBS} ${make_target}
@@ -191,7 +224,7 @@ recover_u64ii_artifact() {
         log_warn "u64ii make exited after building ultimate; finishing updater target directly"
         docker_run_build_script "${CONTAINER_PRELUDE}
 cd /__w
-make -j ${JOBS} -C target/u64ii/riscv/update" 0 0 0 || return 1
+make -j ${JOBS} -C target/u64ii/riscv/update" 0 0 0 1 1 || return 1
     fi
 
     [ -f target/u64ii/riscv/update/result/update.app ] || return 1
@@ -203,7 +236,7 @@ make -j ${JOBS} -C target/u64ii/riscv/update" 0 0 0 || return 1
 
 build_target() {
     local target=$1
-    local output_name versioned_name require_nios=0 require_xilinx=0 require_lattice=0
+    local output_name versioned_name require_nios=0 require_xilinx=0 require_lattice=0 require_riscv=0
     local t_start t_elapsed freshness_file=""
 
     output_name=$(target_output_name "$target")
@@ -212,6 +245,7 @@ build_target() {
     target_requires_nios    "$target" && require_nios=1
     target_requires_xilinx  "$target" && require_xilinx=1
     target_requires_lattice "$target" && require_lattice=1
+    target_requires_riscv   "$target" && require_riscv=1
 
     t_start=$(date +%s)
     if [ "$DRY_RUN" -eq 0 ]; then
@@ -220,10 +254,10 @@ build_target() {
     CURRENT_ACTION="Building ${target}"
 
     local needs_idf=1
-    [ "$target" = "u64" ] && [ "$U64_JTAG_APP_ONLY" -eq 1 ] && needs_idf=0
+    jtag_app_only "$target" && needs_idf=0
 
     if ! docker_run_build_script "$(_build_target_script "$target")" \
-           "$require_nios" "$require_xilinx" "$require_lattice" "$needs_idf"; then
+           "$require_nios" "$require_xilinx" "$require_lattice" "$needs_idf" "$require_riscv"; then
         if [ "$target" = "u64ii" ] && recover_u64ii_artifact "$freshness_file" "$output_name"; then
             :
         else
@@ -237,13 +271,14 @@ build_target() {
         fi
     fi
 
-    if [ "$target" = "u64" ] && [ "$U64_JTAG_APP_ONLY" -eq 1 ]; then
-        if [ "$DRY_RUN" -eq 0 ] \
-           && [ ! -s target/u64/nios2/ultimate/result/ultimate.elf ]; then
+    if jtag_app_only "$target"; then
+        local app_image
+        app_image=$(target_jtag_image "$target")
+        if [ "$DRY_RUN" -eq 0 ] && [ ! -s "$app_image" ]; then
             [ -n "$freshness_file" ] && rm -f "$freshness_file"
             BUILD_FAILED=1
             FAILED_TARGETS+=("$target")
-            log_error "Expected U64 JTAG application ELF was not produced."
+            log_error "Expected ${target} JTAG application ${app_image} was not produced."
             CURRENT_ACTION=""
             return 1
         fi
@@ -315,7 +350,7 @@ build_targets_parallel() {
             # build_target already appended to BUILT_TARGETS/BUILT_ARTIFACTS inside the subshell,
             # so we must rebuild those arrays from what actually exists on disk.
             local art
-            if [ "$tgt" = "u64" ] && [ "$U64_JTAG_APP_ONLY" -eq 1 ]; then
+            if jtag_app_only "$tgt"; then
                 BUILT_TARGETS+=("$tgt")
             else
                 art=$(find_existing_artifact "$tgt" 2>/dev/null || true)
