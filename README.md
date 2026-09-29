@@ -55,6 +55,7 @@ The resulting layout:
     ├── u64ii_jtag.sh                C64U / U64E-II: JTAG tool (pyftdi venv)
     ├── u64ii_jtag.py
     ├── test_u64ii_jtag.py           host tests against a simulated FT232H
+    ├── test_apply_pr.sh             host tests for apply_pr.sh
     ├── c64u_monitor.py              video stream, REST and console watcher
     └── apply_pr.sh                  worktree with upstream PRs applied, uncommitted
 ```
@@ -273,6 +274,13 @@ This reproduces on an unmodified upstream branch, so it is pre-existing rather t
 caused by a local change. Upstream CI stays green because its self-hosted runner uses
 a different image whose g++ is less strict. Before treating a failure here as a
 regression, build the same target from a clean checkout and compare.
+
+To build them with the toolchain upstream CI uses, place a `riscv32-unknown-elf` GCC
+10.2.0 at `riscv/` inside the build tools directory (`--build-tools-dir`), so that
+`<build tools>/riscv/bin/riscv32-unknown-elf-g++` exists. `build-tool` then puts it
+ahead of the image's toolchain for u2, u2pl and u64ii, and stops if its version or
+checksum is not the pinned CI build. Without that directory the image's toolchain is
+used, and no build tools directory is needed for these targets.
 
 `BUILD_TOOL_ALLOW_PARTIAL=1` lets a multi-target run continue past one failing target
 instead of stopping at the first.
