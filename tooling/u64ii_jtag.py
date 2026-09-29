@@ -109,6 +109,14 @@ class JtagError(RuntimeError):
     pass
 
 
+def bitstream_idcode(data: bytes) -> Optional[int]:
+    """The IDCODE a 7-series bitstream is built for, from its IDCODE register write."""
+    at = data.find(b"\x30\x01\x80\x01")       # type 1 write, IDCODE register, 1 word
+    if at < 0 or at + 8 > len(data):
+        return None
+    return int.from_bytes(data[at + 4:at + 8], "big")
+
+
 # One FT232H, several users: a deploy, a console reader, a monitor. They share
 # the per-device flock that `with-device-locks c64u -- ...` takes, so they
 # take turns instead of failing to open the adapter or interleaving scans.
@@ -503,6 +511,7 @@ class Board:
             raise JtagError(f"IDCODE 0x{idcode:08X} is {name}; no Ultimate 64 Elite II "
                             "or C64 Ultimate uses it")
         self.part, self.bitstream = SUPPORTED[masked]
+        self.idcode_value = idcode
         delay = self.tap.bypass_delay()
         if delay != 1:
             raise JtagError(f"the chain has a bypass delay of {delay}, expected one "
@@ -523,27 +532,38 @@ class Board:
             data = handle.read()
         if b"\xaa\x99\x55\x66" not in data[:4096]:
             raise JtagError(f"{path} has no 7-series sync word; not a bitstream")
+        # JPROGRAM erases the running design, so a bitstream for another part
+        # is refused while the board still runs.
+        built_for = bitstream_idcode(data)
+        if built_for is not None and built_for & 0x0FFFFFFF != self.idcode_value & 0x0FFFFFFF:
+            raise JtagError(f"{path} is built for IDCODE 0x{built_for:08X}, not for this "
+                            f"{self.part} (0x{self.idcode_value:08X}); the FPGA was not touched")
         log(f"configuring the {self.part} from {path} ({len(data)} bytes, volatile)")
         started = time.monotonic()
         self.tap.reset()
         self.tap.ir(IR_JPROGRAM)
-        self.tap.idle(10000)
-        deadline = time.monotonic() + 1.0
-        while not self.tap.ir_capture() & IR_CAPTURE_INIT:
-            if time.monotonic() > deadline:
-                raise JtagError("the FPGA did not clear its configuration after JPROGRAM")
-            time.sleep(0.01)
-        self.tap.ir(IR_CFG_IN)
-        self.tap.dr_bitstream(data)
-        self.tap.ir(IR_JSTART)
-        self.tap.idle(2000)
-        status = self.tap.ir_capture()
-        self.tap.reset()
-        self.chain.register = None
-        time.sleep(0.5)
-        if not self.design_loaded():
-            raise JtagError("configuration did not bring up an Ultimate design "
-                            f"(IR capture 0x{status:02X})")
+        try:
+            self.tap.idle(10000)
+            deadline = time.monotonic() + 1.0
+            while not self.tap.ir_capture() & IR_CAPTURE_INIT:
+                if time.monotonic() > deadline:
+                    raise JtagError("the FPGA did not clear its configuration after JPROGRAM")
+                time.sleep(0.01)
+            self.tap.ir(IR_CFG_IN)
+            self.tap.dr_bitstream(data)
+            self.tap.ir(IR_JSTART)
+            self.tap.idle(2000)
+            status = self.tap.ir_capture()
+            self.tap.reset()
+            self.chain.register = None
+            time.sleep(0.5)
+            if not self.design_loaded():
+                raise JtagError("configuration did not bring up an Ultimate design "
+                                f"(IR capture 0x{status:02X})")
+        except BaseException:
+            log("the FPGA is now unconfigured: the machine stays dark until 'fpga' "
+                "succeeds or it is power-cycled")
+            raise
         log(f"configured in {time.monotonic() - started:.1f}s")
 
     # -- application -----------------------------------------------------------

@@ -16,6 +16,7 @@ the scan framing.
     python3 tooling/test_u64ii_jtag.py
 """
 
+import contextlib
 import io
 import os
 import struct
@@ -197,6 +198,8 @@ class ArtixModel:
         self.config_bits = []
         self.configured = True
         self.jprogram = False
+        self.accept_config = True        # False: JSTART leaves the FPGA blank
+        self.ir_shifts = 0               # IR scans seen, to prove none happened
 
     def presented_tdo(self):
         if self.state == SH_IR:
@@ -214,12 +217,13 @@ class ArtixModel:
             capture = 0x01 | (jt.IR_CAPTURE_INIT) | (jt.IR_CAPTURE_DONE if self.configured else 0)
             self.ir_shift = capture
         elif state == SH_IR:
+            self.ir_shifts += 1
             self.ir_shift = (tdi << (jt.IR_LENGTH - 1)) | (self.ir_shift >> 1)
         elif state == UPD_IR:
             self.ir = self.ir_shift & 0x3F
             if self.ir == jt.IR_JPROGRAM:
                 self.configured, self.jprogram, self.config_bits = False, True, []
-            if self.ir == jt.IR_JSTART and self.config_bits:
+            if self.ir == jt.IR_JSTART and self.config_bits and self.accept_config:
                 self.configured = True
         elif state == CAP_DR:
             if self.ir == jt.IR_IDCODE:
@@ -440,6 +444,44 @@ class FlowTest(unittest.TestCase):
                      for i in range(0, len(bits), 8))
         self.assertEqual(sent, body)
         self.assertTrue(model.configured)
+
+    def test_bitstream_for_another_part_is_refused_before_jprogram(self):
+        b, model, _ = board()
+        b.identify()
+        body = (b"\xff" * 16 + b"\xaa\x99\x55\x66" + b"\x30\x01\x80\x01"
+                + (0x03631093).to_bytes(4, "big") + bytes(64))       # an XC7A100T image
+        with tempfile.NamedTemporaryFile(suffix=".bit") as handle:
+            handle.write(body)
+            handle.flush()
+            with self.assertRaisesRegex(jt.JtagError, "not for this XC7A50T"):
+                b.configure(handle.name)
+        self.assertFalse(model.jprogram)
+        self.assertTrue(model.configured)
+
+    def test_bitstream_for_this_part_is_accepted(self):
+        b, model, _ = board()
+        b.identify()
+        body = (b"\xff" * 16 + b"\xaa\x99\x55\x66" + b"\x30\x01\x80\x01"
+                + (0x0362C093).to_bytes(4, "big") + bytes(64))
+        with tempfile.NamedTemporaryFile(suffix=".bit") as handle:
+            handle.write(body)
+            handle.flush()
+            b.configure(handle.name)
+        self.assertTrue(model.jprogram)
+        self.assertTrue(model.configured)
+
+    def test_failed_configuration_says_the_fpga_is_blank(self):
+        model = ArtixModel()
+        model.accept_config = False
+        b, _, _ = board(model)
+        b.identify()
+        out = io.StringIO()
+        with tempfile.NamedTemporaryFile(suffix=".bit") as handle:
+            handle.write(b"\xaa\x99\x55\x66" + bytes(64))
+            handle.flush()
+            with contextlib.redirect_stdout(out), self.assertRaises(jt.JtagError):
+                b.configure(handle.name)
+        self.assertIn("FPGA is now unconfigured", out.getvalue())
 
     def test_main_probe(self):
         model = ArtixModel()
