@@ -1,0 +1,63 @@
+#### Vivado ML Standard Install Configuration ####
+# Batch config for the AMD Unified Installer 2024.1 (web installer
+# FPGAs_AdaptiveSoCs_Unified_2024.1_0522_2023_Lin64.bin), used by
+#   xsetup -b Install -a XilinxEULA,3rdPartyEULA -c install_config.txt
+#
+# Only Artix-7 device support is selected. The Vivado design tool itself is
+# not a module; it is always installed with the edition. mig_7series 4.2,
+# gtwizard 3.6 (7 series) and clk_wiz 6.0 ship in the Vivado IP catalog and
+# need no extra module.
+#
+# Sources for key names and module names:
+# - AUR vivado package, commit 8283132 (pkgver 2024.1, _more_ver 0522_2023),
+#   file install_config-vivado.txt: a ConfigGen output of the same 2024.1
+#   installer build. The Modules list below is that list, verbatim, with only
+#   the 0/1 values changed.
+#   https://aur.archlinux.org/cgit/aur.git/tree/install_config-vivado.txt?h=vivado&id=8283132
+# - yokeTH/vivado-mac scripts/vivado_settings_202302.txt and _202402.txt:
+#   2023.2 and 2024.2 ConfigGen outputs using the same "Artix-7" naming
+#   (2025.x installers rename it to "Artix-7 FPGAs"; do not reuse those).
+#   https://github.com/yokeTH/vivado-mac/tree/main/scripts
+# - AMD UG973 (2024.1), "Batch Mode Installation Flow": Generate a
+#   Configuration File (xsetup -b ConfigGen), Running the Installer
+#   (--agree XilinxEULA,3rdPartyEULA --batch Install --config ...).
+#   https://docs.amd.com/r/2024.1-English/ug973-vivado-release-notes-install-license/Running-the-Installer
+#
+# Installed with this file: a 13.4 GB download and 27 GB on disk, with Artix-7
+# as the only device family.
+#
+# Module names are matched literally by xsetup. If xsetup rejects this file,
+# regenerate it with `<extract dir>/xsetup -b ConfigGen` (choose Vivado, then
+# Vivado ML Standard) and copy only the 0/1 choices across.
+Edition=Vivado ML Standard
+
+Product=Vivado
+
+# Path where AMD FPGAs & Adaptive SoCs software will be installed.
+# install.sh always passes -l, which overrides this value.
+Destination=/opt/Xilinx
+
+# Choose the Products/Devices the you would like to install.
+Modules=Virtex UltraScale+ HBM:0,Kintex UltraScale:0,Vitis Networking P4:0,Artix UltraScale+:0,Spartan-7:0,Artix-7:1,Virtex UltraScale+:0,Vitis Model Composer(Toolbox for MATLAB and Simulink. Includes the functionality of System Generator for DSP):0,DocNav:0,Zynq UltraScale+ MPSoC:0,Zynq-7000:0,Virtex UltraScale+ 58G:0,Power Design Manager (PDM):0,Vitis Embedded Development:0,Kintex-7:0,Install Devices for Kria SOMs and Starter Kits:0,Kintex UltraScale+:0
+
+# Choose the post install scripts you'd like to run as part of the finalization step. Please note that some of these scripts may require user interaction during runtime.
+InstallOptions=
+
+## Shortcuts and File associations ##
+# Choose whether Start menu/Application menu shortcuts will be created or not.
+CreateProgramGroupShortcuts=0
+
+# Choose the name of the Start menu/Application menu shortcut. This setting will be ignored if you choose NOT to create shortcuts.
+ProgramGroupFolder=Xilinx Design Tools
+
+# Choose whether shortcuts will be created for All users or just the Current user. Shortcuts can be created for all users only if you run the installer as administrator.
+CreateShortcutsForAllUsers=0
+
+# Choose whether shortcuts will be created on the desktop or not.
+CreateDesktopShortcuts=0
+
+# Choose whether file associations will be created or not.
+CreateFileAssociation=0
+
+# Choose whether disk usage will be optimized (reduced) after installation
+EnableDiskUsageOptimization=1
