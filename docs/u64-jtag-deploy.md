@@ -79,7 +79,8 @@ Two consequences worth stating explicitly:
   It always loads from the fixed flash address `0x290000`. The absence of a U64
   equivalent is a property of the boot code, not a gap in the tooling.
 
-The U64-II recovery script and this deploy script solve different problems.
+The U64-II recovery script and this deploy script solve different problems. For
+JTAG on the C64 Ultimate and Ultimate 64 Elite II, see `c64u-jtag.md`.
 `recover.py` is a cold-start path for a board that is not running its normal boot
 chain: hold the CPU in reset, upload an image, plant the handoff values, release reset.
 The U64 JTAG loop is a warm swap on a board that already booted.

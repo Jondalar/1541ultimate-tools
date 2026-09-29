@@ -10,7 +10,7 @@ run_uart_monitor() {
         return 1
     fi
 
-    local helper_script="$REPO_DIR/tooling/read_u64_uart_terminal.sh"
+    local helper_script="$TOOLING_DIR/read_u64_uart_terminal.sh"
     if [ ! -x "$helper_script" ]; then
         MONITOR_FAILED=1; FAILED_UART_MONITORS+=("$target")
         log_error "U64 UART monitor helper not found or not executable: $helper_script"
