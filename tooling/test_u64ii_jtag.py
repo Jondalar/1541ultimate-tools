@@ -512,6 +512,17 @@ class FlowTest(unittest.TestCase):
                 b.configure(handle.name)
         self.assertIn("FPGA is now unconfigured", out.getvalue())
 
+    def test_dump_unaligned_range(self):
+        model = ArtixModel()
+        model.memory[0x30000] = b"\x00\x01\x02\x03"
+        model.memory[0x30004] = b"\x04\x05\x06\x07"
+        with tempfile.NamedTemporaryFile() as handle, \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = jt.main(["dump", "0x30002", "4", "-o", handle.name],
+                         mpsse=jt.Mpsse(FakeFtdi(model)))
+            self.assertEqual(rc, 0)
+            self.assertEqual(open(handle.name, "rb").read(), b"\x02\x03\x04\x05")
+
     def test_main_probe(self):
         model = ArtixModel()
         rc = jt.main(["probe"], mpsse=jt.Mpsse(FakeFtdi(model)))

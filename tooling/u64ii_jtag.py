@@ -784,13 +784,16 @@ def cmd_console(board: Board, args) -> int:
 def cmd_dump(board: Board, args) -> int:
     board.require_design()
     address, length = int(args.address, 0), int(args.length, 0)
-    data = board.chain.read(address & ~3, (length + 3) & ~3)
+    if address < 0 or length <= 0:
+        raise JtagError("dump needs a non-negative address and a positive length")
+    start, end = address & ~3, (address + length + 3) & ~3
+    data = board.chain.read(start, end - start)[address - start:address - start + length]
     if args.output:
         with open(args.output, "wb") as handle:
             handle.write(data)
         log(f"wrote {len(data)} bytes to {args.output}")
     else:
-        hexdump(address & ~3, data)
+        hexdump(address, data)
     return 0
 
 
