@@ -119,6 +119,18 @@ class PacketTest(unittest.TestCase):
     def setUp(self):
         self.s = gs.Session(gs.Target(build().read, None, SYMBOLS))
 
+    def test_malformed_packets_get_an_error_reply(self):
+        for packet in ("", "mzz,4", "m10", "Hgzz", "p-1", "M10:zz", "qThreadExtraInfo,"):
+            self.assertEqual(self.s.handle(packet), "E01", packet)
+        self.assertEqual(self.s.handle("qfThreadInfo"), "m3000,3400,3800")
+
+    def test_jtag_failure_gets_an_error_reply(self):
+        def broken(address, length):
+            raise OSError("adapter gone")
+        s = gs.Session(gs.Target(build().read, None, SYMBOLS))
+        s.t._read = broken
+        self.assertEqual(s.handle("m1000,4"), "E01")
+
     def test_threads_and_selection(self):
         self.assertEqual(self.s.handle("qfThreadInfo"), "m3000,3400,3800")
         self.assertEqual(self.s.handle("qsThreadInfo"), "l")

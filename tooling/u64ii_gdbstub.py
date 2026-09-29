@@ -230,6 +230,14 @@ class Session:
         except StubError as exc:
             log(str(exc))
             return "E01"
+        except (ValueError, IndexError, struct.error) as exc:
+            # A malformed packet (empty, bad hex, missing field) must not end the server.
+            log(f"malformed packet {packet[:40]!r}: {exc}")
+            return "E01"
+        except OSError as exc:
+            # The JTAG adapter failed during a transfer; report it, keep serving.
+            log(f"JTAG access failed: {exc}")
+            return "E01"
 
     def _handle(self, p: str) -> Optional[str]:
         if p.startswith("qSupported"):
@@ -267,7 +275,7 @@ class Session:
         if p[0] == "p":
             n = int(p[1:], 16)
             regs = self.t.registers(self.task())
-            return hexle(regs[n]) if n < len(regs) else "E01"
+            return hexle(regs[n]) if 0 <= n < len(regs) else "E01"
         if p[0] == "m":
             addr, length = (int(x, 16) for x in p[1:].split(","))
             return self.t.read(addr, min(length, 0x800)).hex()

@@ -52,5 +52,5 @@ for _ in $(seq 1 100); do
 done
 
 unwind=()
-"$GDB" -q -batch -ex "python print(1)" >/dev/null 2>&1 && unwind=(-ex "source $SCRIPT_DIR/u64ii_gdb_unwind.py")
-"$GDB" -q "$ELF" -ex "set pagination off" "${unwind[@]}" -ex "target extended-remote :$PORT" "$@"
+"$GDB" -q -batch -ex "python print(1)" >/dev/null 2>&1 && unwind=(-ex "source \"$SCRIPT_DIR/u64ii_gdb_unwind.py\"")
+"$GDB" -q "$ELF" -ex "set pagination off" ${unwind[@]+"${unwind[@]}"} -ex "target extended-remote :$PORT" "$@"
