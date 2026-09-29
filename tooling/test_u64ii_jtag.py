@@ -64,6 +64,7 @@ class UserChainModel:
         self.write_data = [0, 0, 0, 0]
         self.pending_reads = []
         self.lost_writes = 0
+        self.stuck = {}                  # address -> word the RAM keeps, whatever is written
 
     def tdo(self):
         if self.isel:
@@ -161,7 +162,8 @@ class UserChainModel:
                     self.write_data[self.byte_count] = byte
                     self.byte_count += 1
                     if self.byte_count == 4:
-                        self.memory[self.address] = bytes(self.write_data)
+                        self.memory[self.address] = self.stuck.get(self.address,
+                                                                   bytes(self.write_data))
                         self.byte_count = 0
                         if self.incrementing:
                             self.address += 4
@@ -254,6 +256,7 @@ class FakeFtdi:
         self.out = bytearray()
         self.closed = False
         self.pins = None
+        self.fail_in_reset = False       # the USB link drops once the CPU is held in reset
 
     def clock(self, tdi=None, tms=None):
         if tdi is not None:
@@ -263,6 +266,8 @@ class FakeFtdi:
         return self.model.rising(self.tms, self.tdi)
 
     def write_data(self, data):
+        if self.fail_in_reset and self.model.chain.write_vector & jt.OUTPUT_CPU_RESET:
+            raise OSError("USB device disconnected")
         data, i = bytes(data), 0
         while i < len(data):
             op = data[i]
@@ -411,6 +416,30 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(words[:512], [jt.RISCV_NOP] * 512)
         self.assertEqual(words[512:], [0x000302B7, 0x00028067])   # lui t0,0x30; jalr x0,0(t0)
         self.assertEqual(model.chain.write_vector, 0)
+
+    def test_failed_load_boots_the_flash_through_the_cache_flush(self):
+        b, model, _ = board()
+        b.identify()
+        model.chain.stuck[jt.APP_ADDRESS + 0x100] = b"\xde\xad\xbe\xef"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaisesRegex(jt.JtagError, "does not hold what was written"):
+            b.run_application(bytes(1024))
+        self.assertEqual(model.chain.write_vector, 0)
+        self.assertEqual(model.memory[0xFFF8], struct.pack("<L", jt.TRAMPOLINE_ADDRESS))
+        self.assertEqual(model.memory[0xFFFC], struct.pack("<L", jt.BOOT_MAGIC_VALUE))
+        tail = [struct.unpack("<L", model.memory[jt.TRAMPOLINE_ADDRESS + 4 * i])[0]
+                for i in (512, 513)]
+        self.assertEqual(tail, [0x800002B7, 0x00028067])       # into the bootloader
+
+    def test_failed_load_says_when_the_cpu_stays_in_reset(self):
+        b, model, ftdi = board()
+        b.identify()
+        ftdi.fail_in_reset = True
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(OSError):
+            b.run_application(bytes(1024))
+        self.assertEqual(model.chain.write_vector, jt.OUTPUT_CPU_RESET)
+        self.assertIn("stays in reset", out.getvalue())
 
     def test_trampoline_reaches_unaligned_targets(self):
         for target in (0x30000, 0x30800, 0x12345678 & ~3):

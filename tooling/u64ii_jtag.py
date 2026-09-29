@@ -595,6 +595,39 @@ class Board:
         words = [RISCV_NOP] * (ICACHE_BYTES // 4) + [lui_t0, jalr]
         return struct.pack(f"<{len(words)}L", *words)
 
+    def request_boot(self, target: int) -> None:
+        """Point the boot request at the cache-flush trampoline, which jumps to `target`."""
+        self.write_verified(TRAMPOLINE_ADDRESS, self.cache_flush_trampoline(target), True)
+        self.write_verified(BOOT_MAGIC_ADDRESS,
+                            struct.pack("<LL", TRAMPOLINE_ADDRESS, BOOT_MAGIC_VALUE), True)
+
+    def release_after_failure(self, flush: bool) -> None:
+        """Release a CPU held in reset after a failed load, and say what is left.
+
+        With `flush`, the boot request goes through the cache flush into the
+        bootloader, as in reset_cpu. Otherwise, or if that write fails too, the
+        request is cleared, and the bootloader boots the flashed application
+        without the flush.
+        """
+        flushed = False
+        if flush:
+            try:
+                self.request_boot(BOOTLOADER_ADDRESS)
+                flushed = True
+            except BaseException as exc:                    # noqa: BLE001
+                log(f"could not set up the cache flush: {exc}")
+        if not flushed:
+            try:
+                self.chain.write(BOOT_MAGIC_ADDRESS, bytes(8))
+            except BaseException as exc:                    # noqa: BLE001
+                log(f"could not clear the boot request: {exc}")
+        try:
+            self.chain.set_outputs(0)
+            log("CPU released; the bootloader starts the flashed application")
+        except BaseException as exc:                        # noqa: BLE001
+            log(f"could not release the CPU ({exc}): it stays in reset until "
+                "'reset' succeeds or the machine is power-cycled")
+
     def run_application(self, image: bytes, verify: bool = True) -> None:
         """Load `image` at 0x30000 and let the bootloader start it.
 
@@ -610,13 +643,10 @@ class Board:
             for offset in range(0, len(image), WRITE_CHUNK):
                 self.write_verified(APP_ADDRESS + offset,
                                     image[offset:offset + WRITE_CHUNK], verify)
-            self.write_verified(TRAMPOLINE_ADDRESS, self.cache_flush_trampoline(APP_ADDRESS), True)
-            self.write_verified(BOOT_MAGIC_ADDRESS,
-                                struct.pack("<LL", TRAMPOLINE_ADDRESS, BOOT_MAGIC_VALUE), True)
+            self.request_boot(APP_ADDRESS)
         except BaseException:
-            log("load failed; clearing the boot request so a reset boots the flash")
-            self.chain.write(BOOT_MAGIC_ADDRESS, bytes(8))
-            self.chain.set_outputs(0)
+            log("load failed")
+            self.release_after_failure(flush=True)
             raise
         self.chain.set_outputs(0)
         log(f"CPU released after {time.monotonic() - started:.1f}s; the bootloader "
@@ -632,12 +662,11 @@ class Board:
         """
         self.chain.set_outputs(OUTPUT_CPU_RESET)
         try:
-            self.write_verified(TRAMPOLINE_ADDRESS,
-                                self.cache_flush_trampoline(BOOTLOADER_ADDRESS), True)
-            self.write_verified(BOOT_MAGIC_ADDRESS,
-                                struct.pack("<LL", TRAMPOLINE_ADDRESS, BOOT_MAGIC_VALUE), True)
-        finally:
-            self.chain.set_outputs(0)
+            self.request_boot(BOOTLOADER_ADDRESS)
+        except BaseException:
+            self.release_after_failure(flush=False)
+            raise
+        self.chain.set_outputs(0)
 
     def console(self, seconds: float, sink=sys.stdout) -> int:
         """Copy the CPU's UART output to `sink` for `seconds` (0 = until Ctrl-C)."""
