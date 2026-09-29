@@ -121,10 +121,16 @@ if a block does not match. `--no-verify` skips the read-back and roughly halves 
 load time.
 
 `run` configures the FPGA before it loads the application, so every hardware block
-starts from reset. `--warm` skips that and only restarts the CPU; the blocks the
-previous application set up keep running until the new one initialises them. Both
-work. The FPGA reload is the default because it is the cleaner state; `--warm` saves
-about 7 s.
+starts from reset. The flashed application then runs for about a second before the
+tool holds the CPU, so blocks it has started, such as the network receive DMA, are
+running again when the new application starts, until it initialises them. `--warm`
+skips the reload and only restarts the CPU, so everything the previous application
+set up keeps running. Both have booted the applications tested so far. The reload is
+the default because it starts from the cleaner state; `--warm` saves about 7 s.
+
+Holding the CPU in reset stops the running application wherever it is. If it was
+writing its configuration or a file to flash at that moment, that write is cut off,
+just as a power cut would cut it off. The tool itself never writes flash.
 
 ### The instruction cache, and why the boot request points at a trampoline
 
@@ -173,9 +179,9 @@ build and takes no arguments. It loads
 `target/u64ii/riscv/ultimate/result/ultimate.bin` and can be rerun on its own. When
 `U64II_VERIFY_HOST` is set, build-tool then checks the machine over REST.
 
-`build-tool` does not deploy a target whose build failed. The deploy scripts load
-whatever image is on disk, so running them after a failed build would start a stale
-image.
+`build-tool` deploys over JTAG only a target it built successfully in the same run,
+unless `--deploy-only` is given. The deploy scripts load whatever image is on disk, so
+running them after a failed or skipped build would start a stale image.
 
 `--jtag-fpga BIT` picks the bitstream (default `auto`). `--jtag-fpga warm` requests
 the application-only swap described above.

@@ -624,11 +624,13 @@ if [ "${#JTAG_TARGETS[@]}" -gt 0 ]; then
     while IFS= read -r _jt_t; do _jt_r+=("$_jt_t"); done \
         < <(resolve_target_list "${JTAG_TARGETS[@]}")
     for _jt_t in "${_jt_r[@]}"; do
-        # The helpers load whatever image is on disk, so a failed build would
-        # otherwise deploy a stale one and report success.
-        if contains_value "$_jt_t" "${FAILED_TARGETS[@]+"${FAILED_TARGETS[@]}"}"; then
+        # The helpers load whatever image is on disk, so a target that failed
+        # or was not built in this run would deploy a stale one and report
+        # success. Same rule as the FTP deploy; --deploy-only opts out.
+        if [ "$DEPLOY_ONLY" -eq 0 ] \
+           && ! contains_value "$_jt_t" "${BUILT_TARGETS[@]+"${BUILT_TARGETS[@]}"}"; then
             DEPLOY_FAILED=1; FAILED_JTAGS+=("$_jt_t")
-            log_error "Not deploying ${_jt_t} over JTAG: its build failed."
+            log_error "Not deploying ${_jt_t} over JTAG: it was not built successfully in this run."
             continue
         fi
         run_jtag_recovery "$_jt_t" || true
