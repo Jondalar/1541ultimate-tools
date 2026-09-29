@@ -65,9 +65,10 @@ configure_build_tools() {
     [ -n "$root" ] || return 0
 
     riscv_base="$root/riscv"
-    if [ "${REQUIRE_RISCV:-0}" = "1" ]; then
-        [ -x "$riscv_base/bin/riscv32-unknown-elf-g++" ] \
-            || container_fail "CI RISC-V toolchain was not found under ${riscv_base}."
+    # A RISC-V toolchain under <build tools>/riscv takes precedence over the
+    # image's own, and is then required to be the build upstream CI uses. With
+    # none mounted, the image's toolchain builds the RISC-V targets.
+    if [ "${REQUIRE_RISCV:-0}" = "1" ] && [ -x "$riscv_base/bin/riscv32-unknown-elf-g++" ]; then
         riscv_version=$("$riscv_base/bin/riscv32-unknown-elf-g++" \
             -dumpfullversion -dumpversion)
         [ "$riscv_version" = "10.2.0" ] \

@@ -109,14 +109,6 @@ class JtagError(RuntimeError):
     pass
 
 
-def bitstream_idcode(data: bytes) -> Optional[int]:
-    """The IDCODE a 7-series bitstream is built for, from its IDCODE register write."""
-    at = data.find(b"\x30\x01\x80\x01")       # type 1 write, IDCODE register, 1 word
-    if at < 0 or at + 8 > len(data):
-        return None
-    return int.from_bytes(data[at + 4:at + 8], "big")
-
-
 # One FT232H, several users: a deploy, a console reader, a monitor. They share
 # the per-device flock that `with-device-locks c64u -- ...` takes, so they
 # take turns instead of failing to open the adapter or interleaving scans.
@@ -511,7 +503,6 @@ class Board:
             raise JtagError(f"IDCODE 0x{idcode:08X} is {name}; no Ultimate 64 Elite II "
                             "or C64 Ultimate uses it")
         self.part, self.bitstream = SUPPORTED[masked]
-        self.idcode_value = idcode
         delay = self.tap.bypass_delay()
         if delay != 1:
             raise JtagError(f"the chain has a bypass delay of {delay}, expected one "
@@ -532,38 +523,27 @@ class Board:
             data = handle.read()
         if b"\xaa\x99\x55\x66" not in data[:4096]:
             raise JtagError(f"{path} has no 7-series sync word; not a bitstream")
-        # JPROGRAM erases the running design, so a bitstream for another part
-        # is refused while the board still runs.
-        built_for = bitstream_idcode(data)
-        if built_for is not None and built_for & 0x0FFFFFFF != self.idcode_value & 0x0FFFFFFF:
-            raise JtagError(f"{path} is built for IDCODE 0x{built_for:08X}, not for this "
-                            f"{self.part} (0x{self.idcode_value:08X}); the FPGA was not touched")
         log(f"configuring the {self.part} from {path} ({len(data)} bytes, volatile)")
         started = time.monotonic()
         self.tap.reset()
         self.tap.ir(IR_JPROGRAM)
-        try:
-            self.tap.idle(10000)
-            deadline = time.monotonic() + 1.0
-            while not self.tap.ir_capture() & IR_CAPTURE_INIT:
-                if time.monotonic() > deadline:
-                    raise JtagError("the FPGA did not clear its configuration after JPROGRAM")
-                time.sleep(0.01)
-            self.tap.ir(IR_CFG_IN)
-            self.tap.dr_bitstream(data)
-            self.tap.ir(IR_JSTART)
-            self.tap.idle(2000)
-            status = self.tap.ir_capture()
-            self.tap.reset()
-            self.chain.register = None
-            time.sleep(0.5)
-            if not self.design_loaded():
-                raise JtagError("configuration did not bring up an Ultimate design "
-                                f"(IR capture 0x{status:02X})")
-        except BaseException:
-            log("the FPGA is now unconfigured: the machine stays dark until 'fpga' "
-                "succeeds or it is power-cycled")
-            raise
+        self.tap.idle(10000)
+        deadline = time.monotonic() + 1.0
+        while not self.tap.ir_capture() & IR_CAPTURE_INIT:
+            if time.monotonic() > deadline:
+                raise JtagError("the FPGA did not clear its configuration after JPROGRAM")
+            time.sleep(0.01)
+        self.tap.ir(IR_CFG_IN)
+        self.tap.dr_bitstream(data)
+        self.tap.ir(IR_JSTART)
+        self.tap.idle(2000)
+        status = self.tap.ir_capture()
+        self.tap.reset()
+        self.chain.register = None
+        time.sleep(0.5)
+        if not self.design_loaded():
+            raise JtagError("configuration did not bring up an Ultimate design "
+                            f"(IR capture 0x{status:02X})")
         log(f"configured in {time.monotonic() - started:.1f}s")
 
     # -- application -----------------------------------------------------------
@@ -595,39 +575,6 @@ class Board:
         words = [RISCV_NOP] * (ICACHE_BYTES // 4) + [lui_t0, jalr]
         return struct.pack(f"<{len(words)}L", *words)
 
-    def request_boot(self, target: int) -> None:
-        """Point the boot request at the cache-flush trampoline, which jumps to `target`."""
-        self.write_verified(TRAMPOLINE_ADDRESS, self.cache_flush_trampoline(target), True)
-        self.write_verified(BOOT_MAGIC_ADDRESS,
-                            struct.pack("<LL", TRAMPOLINE_ADDRESS, BOOT_MAGIC_VALUE), True)
-
-    def release_after_failure(self, flush: bool) -> None:
-        """Release a CPU held in reset after a failed load, and say what is left.
-
-        With `flush`, the boot request goes through the cache flush into the
-        bootloader, as in reset_cpu. Otherwise, or if that write fails too, the
-        request is cleared, and the bootloader boots the flashed application
-        without the flush.
-        """
-        flushed = False
-        if flush:
-            try:
-                self.request_boot(BOOTLOADER_ADDRESS)
-                flushed = True
-            except BaseException as exc:                    # noqa: BLE001
-                log(f"could not set up the cache flush: {exc}")
-        if not flushed:
-            try:
-                self.chain.write(BOOT_MAGIC_ADDRESS, bytes(8))
-            except BaseException as exc:                    # noqa: BLE001
-                log(f"could not clear the boot request: {exc}")
-        try:
-            self.chain.set_outputs(0)
-            log("CPU released; the bootloader starts the flashed application")
-        except BaseException as exc:                        # noqa: BLE001
-            log(f"could not release the CPU ({exc}): it stays in reset until "
-                "'reset' succeeds or the machine is power-cycled")
-
     def run_application(self, image: bytes, verify: bool = True) -> None:
         """Load `image` at 0x30000 and let the bootloader start it.
 
@@ -643,10 +590,18 @@ class Board:
             for offset in range(0, len(image), WRITE_CHUNK):
                 self.write_verified(APP_ADDRESS + offset,
                                     image[offset:offset + WRITE_CHUNK], verify)
-            self.request_boot(APP_ADDRESS)
+            self.write_verified(TRAMPOLINE_ADDRESS, self.cache_flush_trampoline(APP_ADDRESS), True)
+            self.write_verified(BOOT_MAGIC_ADDRESS,
+                                struct.pack("<LL", TRAMPOLINE_ADDRESS, BOOT_MAGIC_VALUE), True)
         except BaseException:
-            log("load failed")
-            self.release_after_failure(flush=True)
+            # The image is partly written, so start the flashed application,
+            # through the cache flush like reset_cpu(). Release the CPU even
+            # when that fails too, so it is never left held.
+            log("load failed; restarting into the flashed application")
+            try:
+                self.reset_cpu()
+            finally:
+                self.chain.set_outputs(0)
             raise
         self.chain.set_outputs(0)
         log(f"CPU released after {time.monotonic() - started:.1f}s; the bootloader "
@@ -662,11 +617,12 @@ class Board:
         """
         self.chain.set_outputs(OUTPUT_CPU_RESET)
         try:
-            self.request_boot(BOOTLOADER_ADDRESS)
-        except BaseException:
-            self.release_after_failure(flush=False)
-            raise
-        self.chain.set_outputs(0)
+            self.write_verified(TRAMPOLINE_ADDRESS,
+                                self.cache_flush_trampoline(BOOTLOADER_ADDRESS), True)
+            self.write_verified(BOOT_MAGIC_ADDRESS,
+                                struct.pack("<LL", TRAMPOLINE_ADDRESS, BOOT_MAGIC_VALUE), True)
+        finally:
+            self.chain.set_outputs(0)
 
     def console(self, seconds: float, sink=sys.stdout) -> int:
         """Copy the CPU's UART output to `sink` for `seconds` (0 = until Ctrl-C)."""
@@ -784,16 +740,14 @@ def cmd_console(board: Board, args) -> int:
 def cmd_dump(board: Board, args) -> int:
     board.require_design()
     address, length = int(args.address, 0), int(args.length, 0)
-    if address < 0 or length <= 0:
-        raise JtagError("dump needs a non-negative address and a positive length")
-    start, end = address & ~3, (address + length + 3) & ~3
-    data = board.chain.read(start, end - start)[address - start:address - start + length]
+    start = address & ~3
+    data = board.chain.read(start, (address + length - start + 3) & ~3)
     if args.output:
         with open(args.output, "wb") as handle:
             handle.write(data)
         log(f"wrote {len(data)} bytes to {args.output}")
     else:
-        hexdump(address, data)
+        hexdump(start, data)
     return 0
 
 

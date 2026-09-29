@@ -55,7 +55,7 @@ CONSOLE_ALERTS = re.compile(
     re.IGNORECASE)
 # Lines containing these are routine and only logged. A client closing its
 # connection first makes the firmware print a socket read or write error, so a
-# status poller such as Vivipi produces them all the time.
+# status poller that connects every few seconds produces them all the time.
 CONSOLE_QUIET = re.compile(r"^(Accept client|HTTP (GET|PUT|POST))|"
                            r"^ERROR (reading from|writing to) socket")
 
@@ -104,7 +104,7 @@ def local_address_towards(host: str) -> str:
 
 # ---------------------------------------------------------------------------
 class VideoWatch(threading.Thread):
-    """Receives the unicast VIC stream and judges it once per second."""
+    """Receives the multicast VIC stream and judges it once per second."""
 
     def __init__(self, args, log: EventLog, stop: threading.Event):
         super().__init__(daemon=True, name="video")
@@ -359,8 +359,12 @@ def main(argv=None) -> int:
     if args.stop:
         try:
             pid = int(open(pidfile).read())
+            cmdline = open(f"/proc/{pid}/cmdline", "rb").read()
         except (OSError, ValueError):
-            print(f"no monitor pid in {pidfile}")
+            print(f"no running monitor for {pidfile}")
+            return 1
+        if b"c64u_monitor" not in cmdline:
+            print(f"pid {pid} in {pidfile} is not a c64u monitor; not signalling it")
             return 1
         os.kill(pid, signal.SIGTERM)
         print(f"sent SIGTERM to {pid}")

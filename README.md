@@ -169,7 +169,7 @@ see `docs/c64u-jtag.md` for wiring and the first `probe`):
 
 ```bash
 ./build-tool --jtag c64u                     # build ultimate.bin, run it from RAM
-./build-tool --jtag c64u --jtag-fpga auto    # configure the FPGA first
+./build-tool --jtag c64u --jtag-fpga warm    # keep the FPGA image, restart only the CPU
 ./build-tool --jtag-monitor c64u             # the application's console output
 tooling/u64ii_jtag.sh probe                  # identify the board; changes nothing
 ```

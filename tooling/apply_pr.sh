@@ -20,8 +20,9 @@
 # A file the PR changes but the target tree does not have (a target this tree
 # does not build, for example) is skipped and listed.
 #
-# Nothing is committed, pushed or written outside WORKTREE and the object
-# database; `git worktree remove WORKTREE` undoes it. Exit status: 0 applied
+# Nothing is committed or pushed. Besides WORKTREE, the fetch updates the
+# remote-tracking refs <remote>/master and <remote>/pr/N of --repo;
+# `git worktree remove WORKTREE` undoes the rest. Exit status: 0 applied
 # cleanly, 3 applied with conflicts to resolve, 1 error.
 
 set -euo pipefail
@@ -71,11 +72,12 @@ for pr in "${PRS[@]}"; do
     mb=$(git -C "$REPO" merge-base "$REMOTE/master" "$head")
     log "PR #$pr: $(git -C "$REPO" rev-parse --short "$mb")..$(git -C "$REPO" rev-parse --short "$head"), $(git -C "$REPO" diff --name-only "$mb" "$head" | wc -l) files"
 
-    # Paths the PR modifies or deletes that this tree does not have.
+    # Paths the PR modifies or deletes that this tree does not have, counting
+    # files an earlier PR in this run has added.
     excludes=()
     while IFS=$'\t' read -r kind path _; do
         [[ "$kind" == A* ]] && continue
-        if ! git -C "$WORKTREE" cat-file -e "HEAD:$path" 2>/dev/null; then
+        if [[ ! -e "$WORKTREE/$path" ]]; then
             excludes+=("--exclude=$path")
             log "  skipped, not in this tree: $path"
         fi
@@ -100,10 +102,12 @@ for pr in "${PRS[@]}"; do
         break
     fi
     rm -f "$patch" "$patch.log"
-    # Leave everything unstaged so the next PR, and the builder, see plain
-    # working-tree changes. Conflicted files keep their markers.
-    [[ $status -eq 0 ]] && git -C "$WORKTREE" reset -q
 done
+
+# `git apply -3` works through the index, so the next PR in this run applies on
+# top of the previous one there. Unstage everything once all are in, so the
+# builder sees plain working-tree changes. Conflicted files keep their markers.
+[[ $status -eq 0 ]] && git -C "$WORKTREE" reset -q
 
 if [[ $status -eq 3 ]]; then
     log "resolve the conflicts in $WORKTREE, then build it with --repo-dir"

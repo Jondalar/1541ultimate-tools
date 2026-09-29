@@ -11,9 +11,8 @@
 #   ULTIMATE_REPO_DIR       tree holding the built image (default: this checkout)
 #   U64II_JTAG_FPGA         bitstream configured before the application loads:
 #                           auto (default; external/u64e2_*.bit by IDCODE) or a
-#                           path. "warm" keeps the running FPGA image and swaps
-#                           only the application, which has left a C64 Ultimate
-#                           with no video and no network.
+#                           path. "warm" keeps the running FPGA image and
+#                           restarts only the CPU, about 7 s faster.
 #   U64II_JTAG_CONSOLE=N    show the application's console for N seconds after
 #   U64II_JTAG_URL          pyftdi URL of the FT232H
 

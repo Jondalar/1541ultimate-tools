@@ -156,7 +156,7 @@ target_requires_riscv() {
 
 target_needs_build_tools() {
     target_requires_nios "$1" || target_requires_xilinx "$1" \
-        || target_requires_lattice "$1" || target_requires_riscv "$1"
+        || target_requires_lattice "$1"
 }
 
 # target_artifact_path TARGET — versioned output filename
