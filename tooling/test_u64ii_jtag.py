@@ -346,6 +346,15 @@ class TapTest(unittest.TestCase):
         b, _, _ = board(model)
         with self.assertRaisesRegex(jt.JtagError, "LFE5U"):
             b.identify()
+        self.assertEqual(model.ir_shifts, 0)     # an Artix IR scan can erase an ECP5
+
+    def test_unknown_part_is_refused_without_an_ir_scan(self):
+        model = ArtixModel()
+        model.IDCODE = 0x12345679
+        b, _, _ = board(model)
+        with self.assertRaisesRegex(jt.JtagError, "not a device this tool knows"):
+            b.identify()
+        self.assertEqual(model.ir_shifts, 0)
 
     def test_unpowered_is_refused(self):
         model = ArtixModel()
