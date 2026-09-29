@@ -11,12 +11,15 @@
 #   --base REF     commit the worktree starts at (default: HEAD of --repo)
 #   --remote NAME  remote of --repo that points at GideonZ/1541ultimate
 #                  (default: found by URL)
-#   --keep         reuse WORKTREE if it exists instead of refusing
+#   --keep         continue in WORKTREE if it exists instead of refusing:
+#                  PRs already applied there are skipped, and conflicts left
+#                  by an earlier run must be resolved first
 #
 # Each PR is applied as its net change: the diff from its merge base with the
 # upstream master to its head. Merging the PR branch instead would also bring
 # in every upstream commit the target tree does not have. The diff is applied
-# with a three-way merge, so conflicts are left as markers to resolve by hand.
+# with a three-way merge, so conflicts are left as markers to resolve by hand;
+# resolve them and rerun with --keep to apply the PRs after the conflicting one.
 # A file the PR changes but the target tree does not have (a target this tree
 # does not build, for example) is skipped and listed.
 #
@@ -33,9 +36,12 @@ die() { printf '[apply-pr] ERROR: %s\n' "$*" >&2; exit 1; }
 REPO="" BASE="HEAD" REMOTE="" KEEP=0 PRS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --repo)   REPO=$2; shift 2 ;;
-        --base)   BASE=$2; shift 2 ;;
-        --remote) REMOTE=$2; shift 2 ;;
+        --repo|--base|--remote)
+            [[ $# -ge 2 ]] || die "$1 needs a value"
+            case "$1" in
+                --repo) REPO=$2 ;; --base) BASE=$2 ;; --remote) REMOTE=$2 ;;
+            esac
+            shift 2 ;;
         --keep)   KEEP=1; shift ;;
         -h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*) die "unknown option $1" ;;
@@ -61,13 +67,42 @@ else
 fi
 WORKTREE=$(cd "$WORKTREE" && pwd -P)
 
-log "fetching master and ${PRS[*]} from $REMOTE"
-refspecs=("master:refs/remotes/$REMOTE/master")
-for pr in "${PRS[@]}"; do refspecs+=("pull/$pr/head:refs/remotes/$REMOTE/pr/$pr"); done
-git -C "$REPO" fetch -q "$REMOTE" "${refspecs[@]}"
+# The PRs applied to WORKTREE so far, kept in its private git directory.
+APPLIED=$(git -C "$WORKTREE" rev-parse --path-format=absolute --git-path apply-pr-applied)
+touch "$APPLIED"
+
+# A continued run: resolved conflicts and the earlier PRs' changes go back into
+# the index, which `git apply -3` requires to match the working tree.
+unresolved=()
+while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    grep -qE '^(<{7}|>{7})( |$)' "$WORKTREE/$path" && unresolved+=("$path")
+done < <(git -C "$WORKTREE" diff --name-only --diff-filter=U)
+if [[ ${#unresolved[@]} -gt 0 ]]; then
+    log "conflict markers remain in:"
+    printf '    %s\n' "${unresolved[@]}" >&2
+    exit 3
+fi
+git -C "$WORKTREE" add -A
+
+pending=()
+for pr in "${PRS[@]}"; do
+    if grep -qx "$pr" "$APPLIED"; then
+        log "PR #$pr: already applied in $WORKTREE"
+    else
+        pending+=("$pr")
+    fi
+done
+
+if [[ ${#pending[@]} -gt 0 ]]; then
+    log "fetching master and ${pending[*]} from $REMOTE"
+    refspecs=("master:refs/remotes/$REMOTE/master")
+    for pr in "${pending[@]}"; do refspecs+=("pull/$pr/head:refs/remotes/$REMOTE/pr/$pr"); done
+    git -C "$REPO" fetch -q "$REMOTE" "${refspecs[@]}"
+fi
 
 status=0
-for pr in "${PRS[@]}"; do
+for pr in "${pending[@]+"${pending[@]}"}"; do
     head="refs/remotes/$REMOTE/pr/$pr"
     mb=$(git -C "$REPO" merge-base "$REMOTE/master" "$head")
     log "PR #$pr: $(git -C "$REPO" rev-parse --short "$mb")..$(git -C "$REPO" rev-parse --short "$head"), $(git -C "$REPO" diff --name-only "$mb" "$head" | wc -l) files"
@@ -88,19 +123,23 @@ for pr in "${PRS[@]}"; do
     if git -C "$WORKTREE" apply -3 "${excludes[@]}" "$patch" 2>"$patch.log"; then
         log "  applied cleanly"
     else
-        conflicts=$(git -C "$WORKTREE" diff --name-only --diff-filter=U)
-        if [[ -z "$conflicts" ]]; then
+        conflicts=()
+        while IFS= read -r path; do conflicts+=("$path"); done \
+            < <(git -C "$WORKTREE" diff --name-only --diff-filter=U)
+        if [[ ${#conflicts[@]} -eq 0 ]]; then
             cat "$patch.log" >&2
             rm -f "$patch" "$patch.log"
             die "PR #$pr did not apply"
         fi
         log "  conflicts to resolve:"
-        printf '    %s\n' $conflicts >&2
+        printf '    %s\n' "${conflicts[@]}" >&2
+        echo "$pr" >> "$APPLIED"
         status=3
         rm -f "$patch" "$patch.log"
-        log "stopping here; apply the remaining PRs after resolving (--keep)"
+        log "stopping here; resolve, then rerun with --keep for the remaining PRs"
         break
     fi
+    echo "$pr" >> "$APPLIED"
     rm -f "$patch" "$patch.log"
 done
 
@@ -110,7 +149,7 @@ done
 [[ $status -eq 0 ]] && git -C "$WORKTREE" reset -q
 
 if [[ $status -eq 3 ]]; then
-    log "resolve the conflicts in $WORKTREE, then build it with --repo-dir"
+    log "resolve the conflicts in $WORKTREE, then rerun with --keep"
 else
     log "ready: $WORKTREE ($(git -C "$WORKTREE" status --short | wc -l) changed paths, nothing committed)"
 fi

@@ -219,7 +219,8 @@ commit the target tree lacks, which matters for the second use below. The diff i
 applied with a three-way merge; files the PR changes but the tree does not have are
 skipped and listed. When conflicts remain, the script exits 3, and the worktree
 (`<repo>-pr705` beside the repository) keeps its markers. Resolve them there and rerun the same
-`build-tool` command, which reuses the worktree. Nothing is committed or pushed;
+`build-tool` command. It continues in that worktree, skips the PRs already applied, and
+applies the ones after the conflict. Nothing is committed or pushed;
 `git worktree remove <path>` undoes it.
 
 The same works for another firmware tree with this layout, such as a C64 Ultimate

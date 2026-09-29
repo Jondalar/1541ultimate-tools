@@ -202,8 +202,9 @@ ${COLOR_BOLD}BUILD OPTIONS${COLOR_RESET}
       --apply-pr N           Build a throwaway worktree of the repo with upstream
                              1541ultimate PR N applied as uncommitted changes
                              (repeatable; tooling/apply_pr.sh). The worktree is
-                             <repo>-pr<N>... beside the repo and is reused when it
-                             exists, so resolve any conflicts there and rerun.
+                             <repo>-pr<N>... beside the repo. After a conflict,
+                             resolve it there and rerun: the PRs after it are
+                             then applied.
       --pr-base REF          Commit that worktree starts at (default: HEAD)
       --check-support        Report which targets are buildable with current setup
       --list-targets         List all targets with their toolchain requirements
@@ -452,13 +453,18 @@ ensure_git_ready
 
 if [ "${#APPLY_PRS[@]}" -gt 0 ]; then
     _pr_tree="${REPO_DIR}-pr$(IFS=-; printf '%s' "${APPLY_PRS[*]}")"
+    # An existing worktree is continued: PRs applied there are skipped, and
+    # those after a resolved conflict are applied now.
+    _pr_args=(--repo "$REPO_DIR" --base "$PR_BASE")
     if [ -d "$_pr_tree" ]; then
-        log_info "Reusing ${_pr_tree}; delete it to apply the PRs afresh."
-    elif [ "$DRY_RUN" -eq 1 ]; then
-        log_info "$(quote_command "$TOOLING_DIR/apply_pr.sh" --repo "$REPO_DIR" --base "$PR_BASE" "${APPLY_PRS[@]}" "$_pr_tree")"
+        log_info "Continuing in ${_pr_tree}; delete it to apply the PRs afresh."
+        _pr_args+=(--keep)
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log_info "$(quote_command "$TOOLING_DIR/apply_pr.sh" "${_pr_args[@]}" "${APPLY_PRS[@]}" "$_pr_tree")"
     else
         _pr_status=0
-        "$TOOLING_DIR/apply_pr.sh" --repo "$REPO_DIR" --base "$PR_BASE" \
+        "$TOOLING_DIR/apply_pr.sh" "${_pr_args[@]}" \
             "${APPLY_PRS[@]}" "$_pr_tree" || _pr_status=$?
         [ "$_pr_status" -eq 3 ] && die_usage "Resolve the conflicts in ${_pr_tree}, then rerun this command."
         [ "$_pr_status" -eq 0 ] || die_usage "Applying ${APPLY_PRS[*]} failed."
