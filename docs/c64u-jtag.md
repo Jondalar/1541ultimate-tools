@@ -357,6 +357,41 @@ running other JTAG commands.
 - To leave the recovery application without flashing, use `fpga`, not `reset`.
   `reset` keeps the kit's FPGA image, which the flashed application does not run on.
 
+### Recovery flow, step by step
+
+This follows `recovery/u64ii/README.md` in the firmware repository (final steps: open the
+file browser, select `update.ue2` on the USB stick, run the update) and is the sequence
+verified on a C64 Ultimate.
+
+1. `tooling/u64ii_jtag.sh probe` shows IDCODE `x362C093` and user ID `0xDEAD1541`.
+2. `tooling/u64ii_jtag.sh recover` (about 18 s). The recovery application reports
+   `Ultimate 64-II`, firmware `3.14c`, FPGA `121`, and serves REST and Telnet.
+3. The recovery application has no `machine:input` and no `machine:menu_screen`, so the
+   menu is driven through Telnet with `tooling/u64ii_menu.py`, which keeps a screen model
+   and prints the screen after every key:
+
+   ```bash
+   M="tooling/u64ii_menu.py <host>"
+   $M start                                  # file browser root: SD, Flash, Temp, USB2, ...
+   $M key down down down enter enter         # a drive shows an Enter popup; Enter again opens it
+   $M key down ... enter                     # to the directory holding the update
+   $M key down ... enter                     # context menu of the update.ue2 file
+   $M wait "Run Update" 5                    # read the menu before choosing
+   $M key enter                              # Run Update
+   ```
+
+4. Run Update hands the machine to the updater. The updater draws on the C64 screen
+   and stops all network services, so REST and Telnet no longer answer, and the JTAG
+   console stays silent. Its prompts need the keyboard of the machine:
+   - Reformat Flash Disk: answer No. Yes erases the Flash disk (configuration, ROMs).
+   - Reset configuration and the WiFi/ESP32 update: leave the default No.
+   - Wait for `Done!` and `PLEASE TURN OFF YOUR MACHINE`, then remove power at the
+     supply. The soft power button is not enough.
+5. After the power cycle the board runs the flashed FPGA image and application. Compare
+   `GET /v1/info` (`firmware_version`, `git_commit_hash`, `fpga_version`) with the update
+   that was installed, and compare `GET /v1/configs` item by item with a snapshot taken
+   before step 2.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
