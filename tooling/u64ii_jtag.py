@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""JTAG access to an Ultimate 64 Elite II or C64 Ultimate through an FT232H.
+"""JTAG access to an Ultimate 64 Elite II or C64 Ultimate through an FT232H
+or a USB-Blaster.
 
 These boards are not built like the Ultimate 64. The FPGA is a Xilinx Artix-7
 (XC7A50T or XC7A100T), the application CPU is a RISC-V soft core, and the
 application is started by a bootloader inside the FPGA image rather than by a
-debugger. There is no Nios II, no USB-Blaster and no nios2-download. The FPGA
+debugger. There is no Nios II and no nios2-download; a USB-Blaster serves only
+as a plain JTAG cable. The FPGA
 image offers a user JTAG chain on USER4 instead
 (fpga/io/jtag/vhdl_source/jtag_client_xilinx.vhd):
 
@@ -25,6 +27,11 @@ brings back the flashed FPGA image and the flashed application.
 Wiring (Adafruit FT232H, I2C mode switch OFF, 3.3 V pin NOT connected):
   D0 -> TCK (P5 pin 1)   D1 -> TDI (P5 pin 9)   D2 <- TDO (P5 pin 3)
   D3 -> TMS (P5 pin 5)   GND -> GND (P5 pin 2 or 10)
+
+Wiring (Altera USB-Blaster or a clone, 09fb:6001, selected with --url blaster):
+its 10-pin plug has the same layout as P5 and goes straight on. TCK is set by
+the cable, not by --frequency.
+
 Switch the machine on before running anything, so that the adapter never
 drives the pins of an unpowered FPGA.
 """
@@ -102,6 +109,8 @@ KNOWN_OTHER = {
 }
 
 DEFAULT_URL = os.environ.get("U64II_JTAG_URL", "ftdi://ftdi:232h/1")
+# A USB-Blaster has no pyftdi vendor name of its own; "blaster" is short for this.
+BLASTER_URL = "ftdi://altera:usbblaster/1"
 DEFAULT_FREQUENCY = float(os.environ.get("U64II_JTAG_FREQUENCY", "3e6"))
 
 
@@ -293,6 +302,168 @@ class Mpsse:
 
 
 # ---------------------------------------------------------------------------
+# USB-Blaster
+# ---------------------------------------------------------------------------
+# Every byte sent is one of two kinds. Bit 7 clear: the pin levels, bit 0 TCK,
+# 1 TMS, 2 nCE, 3 nCS, 4 TDI, 5 output enable (the LED), and with bit 6 set
+# the cable answers one byte whose bit 0 is TDO. Bit 7 set: shift mode, bits
+# 5..0 count the data bytes that follow, each clocked out LSB first with TMS
+# low, and with bit 6 set every one comes back. As openFPGALoader's
+# usbBlaster.cpp.
+BL_TCK, BL_TMS, BL_TDI, BL_READ, BL_SHIFT = 0x01, 0x02, 0x10, 0x40, 0x80
+BL_IDLE = 0x04 | 0x08 | 0x20          # nCE and nCS high, outputs enabled
+BL_PACKET = 64                        # one USB packet
+BL_SHIFT_MAX = 63
+
+
+def _reverse(byte: int) -> int:
+    return int(f"{byte:08b}"[::-1], 2)
+
+
+class Blaster:
+    """What Mpsse offers the Tap, over a USB-Blaster.
+
+    Reads come back in MPSSE layout so the Tap decodes them unchanged: a byte
+    shift returns its bytes, a bit shift or TMS clock returns one byte with
+    the sampled bits entering from the top. MSB-first shifts, which only the
+    bitstream uses, are LSB-first shifts of bit-reversed bytes.
+    """
+
+    def __init__(self, ftdi):
+        self.ftdi = ftdi
+        self.tms_level = BL_TMS
+        self.ops: List[tuple] = []      # (bytes to send, bytes read back, decoder)
+
+    @classmethod
+    def open(cls, url: str = BLASTER_URL, frequency: float = 0) -> "Blaster":
+        try:
+            from pyftdi.ftdi import Ftdi
+        except ImportError as exc:
+            raise JtagError("pyftdi is missing; start this through "
+                            "tooling/u64ii_jtag.sh, which provides it") from exc
+        for add, args in ((Ftdi.add_custom_vendor, (0x09FB, "altera")),
+                          (Ftdi.add_custom_product, (0x09FB, 0x6001, "usbblaster"))):
+            try:
+                add(*args)
+            except ValueError:          # already known
+                pass
+        ftdi = Ftdi()
+        ftdi.open_from_url(url)
+        ftdi.set_latency_timer(2)
+        ftdi.purge_buffers()
+        self = cls(ftdi)
+        # A cable left in shift mode takes up to 63 more bytes as data, so send
+        # more than that, TMS high throughout: the TAP ends in Test-Logic-Reset.
+        flush = bytes((BL_IDLE | BL_TMS, BL_IDLE | BL_TMS | BL_TCK)) * 128
+        for start in range(0, len(flush), BL_PACKET):
+            self._write(flush[start:start + BL_PACKET])
+        self._write(bytes((BL_IDLE | BL_TMS,)))
+        time.sleep(0.02)
+        ftdi.purge_buffers()
+        return self
+
+    def release(self) -> None:
+        """Turn the outputs off before closing, so the cable drives no pin."""
+        try:
+            self.ops.clear()
+            self._write(bytes((0,)))
+        finally:
+            self.ftdi.close()
+
+    # -- queueing --------------------------------------------------------------
+    def _bits(self, tms: List[int], tdi: List[int], read: bool) -> None:
+        out = bytearray()
+        for m, d in zip(tms, tdi):
+            base = BL_IDLE | (BL_TMS if m else 0) | (BL_TDI if d else 0)
+            out += bytes((base, base | BL_TCK | (BL_READ if read else 0)))
+            self.tms_level = BL_TMS if m else 0
+        out.append(BL_IDLE | self.tms_level)              # TCK back low
+        n = len(tms)
+        decode = None
+        if read:
+            def decode(raw, n=n):
+                return bytes((sum((b & 1) << (8 - n + i) for i, b in enumerate(raw)),))
+        self.ops.append((bytes(out), n if read else 0, decode))
+
+    def tms(self, bits: int, count: int, tdi: int = 0, read: bool = False) -> None:
+        self._bits([(bits >> i) & 1 for i in range(count)], [tdi & 1] * count, read)
+
+    def clocks(self, count: int) -> None:
+        self._bits([self.tms_level >> 1] * count, [0] * count, False)
+
+    def bytes_out(self, data: bytes, read: bool = False, msb_first: bool = False) -> None:
+        if msb_first:
+            data = bytes(_reverse(b) for b in data)
+        if self.tms_level:
+            raise JtagError("byte shift with TMS high")
+        for start in range(0, len(data), BL_SHIFT_MAX):
+            chunk = data[start:start + BL_SHIFT_MAX]
+            head = BL_SHIFT | (BL_READ if read else 0) | len(chunk)
+            self.ops.append((bytes((head,)) + chunk, len(chunk) if read else 0,
+                             bytes if read else None))
+
+    def bits_out(self, value: int, count: int, read: bool = False,
+                 msb_first: bool = False) -> None:
+        order = range(7, 7 - count, -1) if msb_first else range(count)
+        self._bits([0] * count, [(value >> i) & 1 for i in order], read)
+
+    # -- transfer --------------------------------------------------------------
+    def _write(self, data: bytes) -> None:
+        if self.ftdi.write_data(data) != len(data):
+            raise JtagError("the USB-Blaster took a short write")
+
+    def _read(self, wanted: int) -> bytes:
+        data = bytes(self.ftdi.read_data_bytes(wanted, attempt=200))
+        if len(data) != wanted:
+            raise JtagError(f"the USB-Blaster returned {len(data)} of {wanted} bytes")
+        return data
+
+    def flush(self) -> bytes:
+        """Send the queue in packets of at most 64 bytes, reading after each."""
+        result = bytearray()
+        packet, reads, decoders = bytearray(), 0, []
+        pieces, self.ops = self.ops, []
+
+        def send():
+            nonlocal packet, reads, decoders
+            if packet:
+                self._write(bytes(packet))
+                raw = self._read(reads) if reads else b""
+                at = 0
+                for n, decode in decoders:
+                    result.extend(decode(raw[at:at + n]))
+                    at += n
+            packet, reads, decoders = bytearray(), 0, []
+
+        for data, nread, decode in pieces:
+            if data[0] & BL_SHIFT or len(data) <= BL_PACKET:
+                if len(packet) + len(data) > BL_PACKET:
+                    send()
+                packet += data
+                reads += nread
+                if decode:
+                    decoders.append((nread, decode))
+            else:
+                # A long pin-level run is idle clocking (reads are at most 8
+                # bits), so it splits anywhere.
+                send()
+                for start in range(0, len(data), BL_PACKET):
+                    self._write(data[start:start + BL_PACKET])
+        send()
+        return bytes(result)
+
+
+def open_cable(url: str, frequency: float):
+    """The cable the URL names: a USB-Blaster for 'blaster' or an altera URL,
+    else an FT232H."""
+    if url in ("blaster", "usbblaster"):
+        url = BLASTER_URL
+    if url.startswith("ftdi://altera:") or url.startswith("ftdi://0x9fb:"):
+        return Blaster.open(url, frequency)
+    return Mpsse.open(url, frequency)
+
+
+# ---------------------------------------------------------------------------
 # TAP
 # ---------------------------------------------------------------------------
 class Tap:
@@ -471,7 +642,7 @@ class UserChain:
 class Board:
     def __init__(self, url: str = DEFAULT_URL, frequency: float = DEFAULT_FREQUENCY,
                  mpsse: Optional[Mpsse] = None):
-        self.mpsse = mpsse or Mpsse.open(url, frequency)
+        self.mpsse = mpsse or open_cable(url, frequency)
         self.tap = Tap(self.mpsse)
         self.chain = UserChain(self.tap)
         self.part: Optional[str] = None
@@ -800,12 +971,13 @@ def cmd_dump(board: Board, args) -> int:
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="JTAG for the Ultimate 64 Elite II and C64 Ultimate (Artix-7) "
-                    "through an FT232H. Volatile only: nothing writes the flash.")
+                    "through an FT232H or a USB-Blaster. Volatile only: nothing writes the flash.")
     parser.add_argument("--url", default=DEFAULT_URL,
                         help=f"pyftdi URL of the FT232H (default {DEFAULT_URL}, "
-                             "or $U64II_JTAG_URL)")
+                             "or $U64II_JTAG_URL); 'blaster' for a USB-Blaster")
     parser.add_argument("--frequency", type=float, default=DEFAULT_FREQUENCY,
-                        help="TCK in Hz (default 3e6); lower it for long wires")
+                        help="TCK in Hz (default 3e6); lower it for long wires. "
+                             "FT232H only")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("probe", help="identify the FPGA and the running design; changes nothing")
