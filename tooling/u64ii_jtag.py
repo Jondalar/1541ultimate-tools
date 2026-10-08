@@ -367,8 +367,9 @@ class Blaster:
         try:
             self.ops.clear()
             self._write(bytes((0,)))
-        finally:
-            self.ftdi.close()
+        except Exception:                                   # noqa: BLE001
+            pass
+        self.ftdi.close()
 
     # -- queueing --------------------------------------------------------------
     def _bits(self, tms: List[int], tdi: List[int], read: bool) -> None:

@@ -384,13 +384,19 @@ class FakeBlaster:
 CABLE = "ft232h"
 
 
-def board(model=None):
-    model = model or ArtixModel()
+def cable(model):
+    """The simulated cable the running test class asks for, and its device."""
     if CABLE == "blaster":
         ftdi = FakeBlaster(model)
-        return jt.Board(mpsse=jt.Blaster(ftdi)), model, ftdi
+        return jt.Blaster(ftdi), ftdi
     ftdi = FakeFtdi(model)
-    return jt.Board(mpsse=jt.Mpsse(ftdi)), model, ftdi
+    return jt.Mpsse(ftdi), ftdi
+
+
+def board(model=None):
+    model = model or ArtixModel()
+    driver, ftdi = cable(model)
+    return jt.Board(mpsse=driver), model, ftdi
 
 
 class TapTest(unittest.TestCase):
@@ -605,13 +611,13 @@ class FlowTest(unittest.TestCase):
         with tempfile.NamedTemporaryFile() as handle, \
                 contextlib.redirect_stdout(io.StringIO()):
             rc = jt.main(["dump", "0x30002", "4", "-o", handle.name],
-                         mpsse=jt.Mpsse(FakeFtdi(model)))
+                         mpsse=cable(model)[0])
             self.assertEqual(rc, 0)
             self.assertEqual(open(handle.name, "rb").read(), b"\x02\x03\x04\x05")
 
     def test_main_probe(self):
         model = ArtixModel()
-        rc = jt.main(["probe"], mpsse=jt.Mpsse(FakeFtdi(model)))
+        rc = jt.main(["probe"], mpsse=cable(model)[0])
         self.assertEqual(rc, 0)
 
 
@@ -641,12 +647,22 @@ class BlasterUserChainTest(OnBlaster, UserChainTest):
 
 
 class BlasterFlowTest(OnBlaster, FlowTest):
-    def test_main_probe(self):
-        rc = jt.main(["probe"], mpsse=jt.Blaster(FakeBlaster(ArtixModel())))
-        self.assertEqual(rc, 0)
+    pass
 
 
 class BlasterTest(unittest.TestCase):
+    def test_release_on_a_dead_link_keeps_the_original_error(self):
+        # As Mpsse.release(): a cable that is gone must not replace the error
+        # that ended the session, and the port must still be closed.
+        b, _, ftdi = board_on_blaster()
+        b.identify()
+        with self.assertRaises(jt.JtagError):
+            with b:
+                ftdi.fail_in_reset = True
+                ftdi.model.chain.write_vector = jt.OUTPUT_CPU_RESET
+                raise jt.JtagError("the session failed")
+        self.assertTrue(ftdi.closed)
+
     def test_packets_fit_one_usb_packet(self):
         b, model, ftdi = board_on_blaster()
         b.identify()
