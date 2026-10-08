@@ -109,7 +109,8 @@ KNOWN_OTHER = {
 }
 
 DEFAULT_URL = os.environ.get("U64II_JTAG_URL", "ftdi://ftdi:232h/1")
-# A USB-Blaster has no pyftdi vendor name of its own; "blaster" is short for this.
+# A USB-Blaster has no pyftdi vendor name of its own; Blaster.open registers
+# "altera" and "usbblaster". --url blaster resolves to this URL plus a serial.
 BLASTER_URL = "ftdi://altera:usbblaster/1"
 DEFAULT_FREQUENCY = float(os.environ.get("U64II_JTAG_FREQUENCY", "3e6"))
 
@@ -316,8 +317,8 @@ BL_PACKET = 64                        # one USB packet
 BL_SHIFT_MAX = 63
 
 
-def _reverse(byte: int) -> int:
-    return int(f"{byte:08b}"[::-1], 2)
+# Each byte with its bits in the opposite order, for bytes.translate.
+_REVERSED = bytes(int(f"{b:08b}"[::-1], 2) for b in range(256))
 
 
 class Blaster:
@@ -348,7 +349,12 @@ class Blaster:
             except ValueError:          # already known
                 pass
         ftdi = Ftdi()
-        ftdi.open_from_url(url)
+        try:
+            ftdi.open_from_url(url)
+        except Exception as exc:                            # noqa: BLE001
+            # pyftdi raises USBError, ValueError or its own errors here
+            raise JtagError(f"cannot open the USB-Blaster at {url}: {exc}. Is another "
+                            "program holding it, for example Quartus' jtagd?") from exc
         ftdi.set_latency_timer(2)
         ftdi.purge_buffers()
         self = cls(ftdi)
@@ -394,7 +400,7 @@ class Blaster:
 
     def bytes_out(self, data: bytes, read: bool = False, msb_first: bool = False) -> None:
         if msb_first:
-            data = bytes(_reverse(b) for b in data)
+            data = data.translate(_REVERSED)
         if self.tms_level:
             raise JtagError("byte shift with TMS high")
         for start in range(0, len(data), BL_SHIFT_MAX):
@@ -454,11 +460,54 @@ class Blaster:
         return bytes(result)
 
 
+def find_blasters() -> List[Tuple[Optional[str], int, int]]:
+    """(serial, bus, address) of every attached USB-Blaster."""
+    try:
+        from pyftdi.usbtools import UsbTools
+    except ImportError as exc:
+        raise JtagError("pyftdi is missing; start this through "
+                        "tooling/u64ii_jtag.sh, which provides it") from exc
+    found = UsbTools.find_all([(0x09FB, 0x6001)])
+    return sorted(((desc.sn, desc.bus, desc.address) for desc, _ in found),
+                  key=lambda d: (d[1], d[2]))
+
+
+def blaster_url(name: str) -> str:
+    """The pyftdi URL for 'blaster' or 'blaster:<serial>'.
+
+    A plain 'blaster' must be the only one attached: with a second one, say the
+    one on an Ultimate 64, it could open the wrong machine's cable. The part
+    after the colon is a serial number, or pyftdi's bus:address (hex) for
+    clones whose serial numbers clash.
+    """
+    blasters = find_blasters()
+    places = [f"{bus:x}:{address:x}" for _, bus, address in blasters]
+    listing = ", ".join(f"blaster:{sn}" if sn else f"blaster:{place}"
+                        for (sn, _, _), place in zip(blasters, places))
+    _, _, which = name.partition(":")
+    if which:
+        serials = [sn for sn, _, _ in blasters]
+        if which not in serials and which not in places:
+            raise JtagError(f"no USB-Blaster '{which}' is attached"
+                            + (f"; attached: {listing}" if blasters else ""))
+        if serials.count(which) > 1:
+            raise JtagError(f"several USB-Blasters report the serial number {which}; "
+                            "name one by bus and address: "
+                            + ", ".join(f"blaster:{p}" for p in places))
+        return f"ftdi://altera:usbblaster:{which}/1"
+    if not blasters:
+        raise JtagError("no USB-Blaster is attached")
+    if len(blasters) > 1:
+        raise JtagError(f"{len(blasters)} USB-Blasters are attached; name the one on "
+                        f"this machine with --url or U64II_JTAG_URL: {listing}")
+    return f"ftdi://altera:usbblaster:{blasters[0][0] or places[0]}/1"
+
+
 def open_cable(url: str, frequency: float):
-    """The cable the URL names: a USB-Blaster for 'blaster' or an altera URL,
-    else an FT232H."""
-    if url in ("blaster", "usbblaster"):
-        url = BLASTER_URL
+    """The cable the URL names: a USB-Blaster for 'blaster', 'blaster:<serial>'
+    or an altera URL, else an FT232H."""
+    if url.split(":", 1)[0] in ("blaster", "usbblaster"):
+        url = blaster_url(url)
     if url.startswith("ftdi://altera:") or url.startswith("ftdi://0x9fb:"):
         return Blaster.open(url, frequency)
     return Mpsse.open(url, frequency)
@@ -687,7 +736,9 @@ class Board:
         delay = self.tap.bypass_delay()
         if delay != 1:
             raise JtagError(f"the chain has a bypass delay of {delay}, expected one "
-                            "device; check the wiring, or lower --frequency")
+                            "device; check the wiring"
+                            + (", or lower --frequency" if isinstance(self.mpsse, Mpsse)
+                               else ""))
         return idcode
 
     def design_loaded(self) -> bool:

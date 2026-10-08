@@ -669,20 +669,62 @@ class BlasterTest(unittest.TestCase):
         b.run_application(bytes(range(256)) * 40)
         self.assertLessEqual(max(ftdi.packets), jt.BL_PACKET)
 
-    def test_url_selects_the_cable(self):
+    def open_with(self, attached, *urls):
+        """Open each URL with these (serial, bus, address) Blasters attached."""
         opened = []
-        saved = jt.Blaster.open, jt.Mpsse.open
+        saved = jt.Blaster.open, jt.Mpsse.open, jt.find_blasters
         try:
             jt.Blaster.open = classmethod(lambda cls, url, f: opened.append(("blaster", url)))
             jt.Mpsse.open = classmethod(lambda cls, url, f: opened.append(("ft232h", url)))
-            jt.open_cable("blaster", 3e6)
-            jt.open_cable("ftdi://altera:usbblaster/2", 3e6)
-            jt.open_cable("ftdi://ftdi:232h/1", 3e6)
+            jt.find_blasters = lambda: list(attached)
+            for url in urls:
+                jt.open_cable(url, 3e6)
         finally:
-            jt.Blaster.open, jt.Mpsse.open = saved
-        self.assertEqual(opened, [("blaster", jt.BLASTER_URL),
+            jt.Blaster.open, jt.Mpsse.open, jt.find_blasters = saved
+        return opened
+
+    def test_url_selects_the_cable(self):
+        opened = self.open_with([("8aB75VK4", 1, 5)], "blaster",
+                                "ftdi://altera:usbblaster/2", "ftdi://ftdi:232h/1")
+        self.assertEqual(opened, [("blaster", "ftdi://altera:usbblaster:8aB75VK4/1"),
                                   ("blaster", "ftdi://altera:usbblaster/2"),
                                   ("ft232h", "ftdi://ftdi:232h/1")])
+
+    def test_plain_blaster_refuses_when_several_are_attached(self):
+        with self.assertRaises(jt.JtagError) as ctx:
+            self.open_with([("A1", 1, 4), ("B2", 1, 7)], "blaster")
+        self.assertIn("blaster:A1, blaster:B2", str(ctx.exception))
+
+    def test_plain_blaster_refuses_when_none_is_attached(self):
+        with self.assertRaises(jt.JtagError):
+            self.open_with([], "blaster")
+
+    def test_serial_picks_one_of_several(self):
+        opened = self.open_with([("A1", 1, 4), ("B2", 1, 7)], "blaster:B2")
+        self.assertEqual(opened, [("blaster", "ftdi://altera:usbblaster:B2/1")])
+
+    def test_unknown_serial_lists_the_attached_ones(self):
+        with self.assertRaises(jt.JtagError) as ctx:
+            self.open_with([("A1", 1, 4)], "blaster:B2")
+        self.assertIn("blaster:A1", str(ctx.exception))
+
+    def test_clashing_serials_need_bus_and_address(self):
+        with self.assertRaises(jt.JtagError) as ctx:
+            self.open_with([("SAME", 1, 4), ("SAME", 2, 26)], "blaster:SAME")
+        # pyftdi reads bus and address as hex
+        self.assertIn("blaster:1:4, blaster:2:1a", str(ctx.exception))
+        opened = self.open_with([("SAME", 1, 4), ("SAME", 2, 26)], "blaster:2:1a")
+        self.assertEqual(opened, [("blaster", "ftdi://altera:usbblaster:2:1a/1")])
+
+    def test_bypass_hint_names_frequency_only_for_the_ft232h(self):
+        for cable in ("ft232h", "blaster"):
+            model = ArtixModel()
+            b = (jt.Board(mpsse=jt.Blaster(FakeBlaster(model))) if cable == "blaster"
+                 else jt.Board(mpsse=jt.Mpsse(FakeFtdi(model))))
+            b.tap.bypass_delay = lambda: 0
+            with self.assertRaises(jt.JtagError) as ctx:
+                b.identify()
+            self.assertEqual("--frequency" in str(ctx.exception), cable == "ft232h")
 
 
 def board_on_blaster():

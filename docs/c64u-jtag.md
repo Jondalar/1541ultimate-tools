@@ -71,7 +71,24 @@ plug has the layout of P5 (TCK 1, GND 2, TDO 3, VCC sense 4, TMS 5, TDI 9, GND 1
 goes straight on, no wires. Select it with `--url blaster` or
 `U64II_JTAG_URL=blaster`; every command, the gdb server and the monitor take it.
 
+`blaster` opens a USB-Blaster only when it is the only one attached. With a second
+one on the same host, for example on an Ultimate 64, it stops and lists what it
+found, because it could otherwise open the other machine's cable. Name the one on
+this machine by its serial number:
+
+```bash
+U64II_JTAG_URL=blaster:8aB75VK4 tooling/u64ii_jtag.sh probe
+```
+
+Clones whose serial numbers clash are named by bus and address instead, in hex as
+pyftdi reads them, for example `blaster:1:1a`; the list shows that form for them.
+A Blaster held by another program, such as Quartus' `jtagd`, cannot be opened, and
+the error says so.
+
 - TCK is set by the cable; `--frequency` does not apply.
+- When a command ends the tool switches the cable's outputs off (bit 5). That turns
+  the drivers off on an original USB-Blaster; some clones use the bit only for the
+  LED and keep driving TCK, TMS and TDI. To be sure, unplug the USB.
 - Unplug the Blaster's USB before switching the machine on or off. With the cable
   active at power-on a C64 Ultimate has been seen to stay dark, its FPGA not loaded
   from flash; an idle, plugged-in Blaster has also booted normally, so this is a
